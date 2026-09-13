@@ -98,7 +98,7 @@ async def google_callback(code: str, state: str = ""):
     token = create_token(user["id"])
 
     # Redirect to frontend; token passed in URL fragment (not logged by servers)
-    frontend = config.CORS_ORIGINS[0].rstrip("/")
+    frontend = config.FRONTEND_URL.rstrip("/")
     return RedirectResponse(f"{frontend}/#token={token}", status_code=302)
 
 
