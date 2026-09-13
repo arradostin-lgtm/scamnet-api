@@ -1,76 +1,21 @@
-"""Face embedding extraction, perceptual hashing, and similarity search."""
+"""Face analysis via Claude Vision API + perceptual hashing."""
+import base64
 import hashlib
 import io
-import struct
-import numpy as np
-from pathlib import Path
+import json
 from typing import Optional
 
-from config import FACE_MODEL, FACE_MATCH_THRESHOLD, FACE_HIGH_THRESHOLD
 
-# ── Embedding extraction ───────────────────────────────────────────────────────
-
-def extract_embedding(image_bytes: bytes) -> Optional[np.ndarray]:
-    """
-    Extract a face embedding from raw image bytes.
-    Returns a float32 numpy array or None if no face detected.
-    """
-    if FACE_MODEL == "face_recognition":
-        return _extract_face_recognition(image_bytes)
-    elif FACE_MODEL == "insightface":
-        return _extract_insightface(image_bytes)
-    else:
-        raise ValueError(f"Unknown face model: {FACE_MODEL}")
-
-
-def _extract_face_recognition(image_bytes: bytes) -> Optional[np.ndarray]:
-    try:
-        import face_recognition
-        import PIL.Image
-        img = PIL.Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
-        encodings = face_recognition.face_encodings(arr)
-        if not encodings:
-            return None
-        # Use first (largest) face; 128-dim float64 → float32
-        return encodings[0].astype(np.float32)
-    except ImportError:
-        raise RuntimeError("face_recognition not installed: pip install face-recognition")
-
-
-def _extract_insightface(image_bytes: bytes) -> Optional[np.ndarray]:
-    try:
-        import insightface
-        import cv2
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        app = insightface.app.FaceAnalysis()
-        app.prepare(ctx_id=-1)  # CPU
-        faces = app.get(img)
-        if not faces:
-            return None
-        # Sort by detection score, take best
-        faces.sort(key=lambda f: f.det_score, reverse=True)
-        return faces[0].embedding.astype(np.float32)
-    except ImportError:
-        raise RuntimeError("insightface not installed: pip install insightface")
-
-
-# ── Perceptual hash ────────────────────────────────────────────────────────────
+# ── Perceptual hash ───────────────────────────────────────────────────────────
 
 def compute_phash(image_bytes: bytes) -> str:
-    """
-    Compute a perceptual hash (pHash) of the largest face region.
-    Falls back to full-image pHash if no face detected.
-    Returns a 16-character hex string (64-bit hash).
-    """
+    """64-bit perceptual hash as 16-char hex string."""
     try:
         from PIL import Image
         import imagehash
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
         return str(imagehash.phash(img))
-    except ImportError:
-        # Fallback: simple average hash without imagehash library
+    except Exception:
         from PIL import Image
         img = Image.open(io.BytesIO(image_bytes)).convert("L").resize((8, 8))
         pixels = list(img.getdata())
@@ -83,67 +28,190 @@ def image_sha256(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 
-# ── Embedding serialisation ────────────────────────────────────────────────────
-
-def embedding_to_blob(arr: np.ndarray) -> bytes:
-    return arr.astype(np.float32).tobytes()
+def image_to_base64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode()
 
 
-def blob_to_embedding(blob: bytes, dim: int) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32).reshape(dim)
+def _media_type(image_bytes: bytes) -> str:
+    if image_bytes[:4] == b'\x89PNG':
+        return "image/png"
+    if image_bytes[:2] in (b'\xff\xd8',):
+        return "image/jpeg"
+    if b'WEBP' in image_bytes[:12]:
+        return "image/webp"
+    return "image/jpeg"
 
 
-# ── Similarity ─────────────────────────────────────────────────────────────────
+# ── Claude Vision: face comparison ────────────────────────────────────────────
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity in [−1, 1]. Higher = more similar."""
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
-
-def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """L2 distance. Lower = more similar. face_recognition uses this."""
-    return float(np.linalg.norm(a - b))
-
-
-def is_match(query: np.ndarray, stored: np.ndarray) -> tuple[bool, float]:
+def compare_faces_with_claude(
+    query_bytes: bytes,
+    stored_profiles: list,  # [{"profile_id": str, "image_bytes": bytes, "name": str}]
+) -> dict:
     """
-    Returns (is_match, confidence_0_to_1).
-    For face_recognition (128-d), threshold on L2 distance.
-    For insightface (512-d), threshold on cosine similarity.
+    Compare query photo against stored scammer profile photos using Claude Vision.
+    Returns: {matched, profile_id, confidence, reasoning}
     """
-    if query.shape[0] == 128:
-        dist = euclidean_distance(query, stored)
-        confidence = max(0.0, 1.0 - dist / 0.9)   # normalise roughly to 0–1
-        return dist <= FACE_MATCH_THRESHOLD, confidence
-    else:
-        sim = cosine_similarity(query, stored)
-        return sim >= (1 - FACE_MATCH_THRESHOLD), sim
+    if not stored_profiles:
+        return {
+            "matched": False,
+            "profile_id": None,
+            "confidence": 0.0,
+            "reasoning": "No profiles in database",
+        }
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "You are a face verification system for a fraud detection service.\n"
+                "Compare the QUERY face image with each PROFILE image below.\n"
+                "Determine if the QUERY shows the SAME real person as any PROFILE.\n"
+                "Focus on: bone structure, eyes, nose, mouth, ears, jawline.\n"
+                "Ignore: lighting, angle, age ±5 years, expression, accessories.\n\n"
+                "QUERY IMAGE:"
+            ),
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": _media_type(query_bytes),
+                "data": image_to_base64(query_bytes),
+            },
+        },
+    ]
+
+    for i, prof in enumerate(stored_profiles[:5]):
+        content.append({
+            "type": "text",
+            "text": f"\nPROFILE {i + 1} (id={prof['profile_id']}, name={prof.get('name', '?')}):",
+        })
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": _media_type(prof["image_bytes"]),
+                "data": image_to_base64(prof["image_bytes"]),
+            },
+        })
+
+    content.append({
+        "type": "text",
+        "text": (
+            "\nRespond ONLY with valid JSON (no markdown):\n"
+            '{"matched": true|false, "profile_id": "id string or null", '
+            '"confidence": 0.0-1.0, "reasoning": "1-2 sentences"}\n'
+            "Set matched=true ONLY if confidence >= 0.70."
+        ),
+    })
+
+    try:
+        from anthropic import Anthropic
+        msg = Anthropic().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = msg.content[0].text.strip()
+        start, end = text.find("{"), text.rfind("}") + 1
+        if start == -1:
+            raise ValueError("No JSON in response")
+        return json.loads(text[start:end])
+    except Exception as e:
+        return {
+            "matched": False,
+            "profile_id": None,
+            "confidence": 0.0,
+            "reasoning": f"Comparison error: {e}",
+        }
 
 
-# ── DB search ─────────────────────────────────────────────────────────────────
+# ── Claude Vision: AI-generated image detection ───────────────────────────────
 
-def find_best_match(query_embedding: np.ndarray, conn) -> Optional[dict]:
+def detect_ai_image(image_bytes: bytes) -> dict:
     """
-    Linear scan of face_embeddings table.
-    Returns the best-matching row dict + confidence, or None.
-
-    For production: replace with ANN index (FAISS / Chroma).
+    Detect if a face photo is AI-generated using Claude Vision + local heuristics.
+    Returns: {is_ai, confidence, model_hint}
     """
-    rows = conn.execute(
-        "SELECT id, profile_id, embedding, embedding_dim, model FROM face_embeddings"
-    ).fetchall()
+    local_score = _local_ai_heuristic(image_bytes)
 
-    best = None
-    best_conf = 0.0
+    try:
+        from anthropic import Anthropic
+        msg = Anthropic().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Is this face photo AI-generated (GAN, deepfake, Midjourney, DALL-E, "
+                            "Stable Diffusion, etc.)?\n"
+                            "Signs: unnatural skin, blurry background, asymmetric ears, garbled accessories, "
+                            "inconsistent lighting, overly perfect features.\n"
+                            "Respond ONLY with JSON: "
+                            '{"is_ai": true|false, "confidence": 0.0-1.0, '
+                            '"model_hint": "midjourney|dalle|stable_diffusion|deepfake|real|unknown"}'
+                        ),
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": _media_type(image_bytes),
+                            "data": image_to_base64(image_bytes),
+                        },
+                    },
+                ],
+            }],
+        )
+        text = msg.content[0].text.strip()
+        start, end = text.find("{"), text.rfind("}") + 1
+        result = json.loads(text[start:end])
+        # Blend Claude's read with local heuristic (70/30)
+        blended = 0.7 * float(result.get("confidence", 0.5)) + 0.3 * local_score
+        return {
+            "is_ai": blended >= 0.5,
+            "confidence": round(blended, 3),
+            "model_hint": result.get("model_hint", "unknown"),
+        }
+    except Exception:
+        return {
+            "is_ai": local_score >= 0.5,
+            "confidence": round(local_score, 3),
+            "model_hint": "unknown",
+        }
 
-    for row in rows:
-        stored = blob_to_embedding(row["embedding"], row["embedding_dim"])
-        matched, conf = is_match(query_embedding, stored)
-        if matched and conf > best_conf:
-            best_conf = conf
-            best = {"face_emb_id": row["id"], "profile_id": row["profile_id"], "confidence": conf}
 
-    return best if best else None
+def _local_ai_heuristic(image_bytes: bytes) -> float:
+    """Quick local AI-image probability (0–1) without API calls."""
+    signals = []
+
+    # No EXIF camera data → more likely AI
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        exif = getattr(img, "_getexif", lambda: None)()
+        if exif is None:
+            signals.append(0.6)
+        else:
+            from PIL.ExifTags import TAGS
+            tags = {TAGS.get(k, k): v for k, v in exif.items()}
+            signals.append(0.15 if any(k in tags for k in ("Make", "Model")) else 0.55)
+    except Exception:
+        signals.append(0.5)
+
+    # Low hue variance → GAN artifact
+    try:
+        import numpy as np
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes)).convert("HSV").resize((64, 64))
+        arr = np.array(img)
+        hue_std = float(arr[:, :, 0].std())
+        signals.append(0.65 if hue_std < 12 else (0.45 if hue_std < 25 else 0.2))
+    except Exception:
+        signals.append(0.5)
+
+    return sum(signals) / len(signals)

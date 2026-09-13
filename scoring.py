@@ -1,20 +1,17 @@
 """
 Scamnet Risk Scoring Engine
 ────────────────────────────
-Inputs:  face embedding (optional), voice embedding (optional), image bytes (for AI detection)
-Output:  RiskResult with score 0–100 and level: clean | warning | high | confirmed
-
-Score formula (max 100 pts):
-  db_match      0–60   direct hit in verified-scammer DB
+Score formula (max 100 pts, capped):
+  db_match      0–60   Claude Vision confirms same person as a known scammer
   crowdsource   0–25   unique people who independently checked this face
   reports       0–20   verified user reports linked to this face hash
-  ai_flag       0–20   face photo is AI-generated (can exceed 100 → capped)
+  ai_flag       0–20   face photo detected as AI-generated
 
 Level thresholds:
   0–15   → clean
   16–45  → warning
   46–79  → high
-  80–100 → confirmed
+  80+    → confirmed
 """
 from __future__ import annotations
 import math
@@ -22,10 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import config
-from face import (
-    find_best_match, compute_phash, extract_embedding,
-    image_sha256, embedding_to_blob
-)
+from face import compute_phash, image_sha256, compare_faces_with_claude, detect_ai_image
 from database import db, row_to_dict
 
 
@@ -54,8 +48,8 @@ class CrowdsourceSignal:
 
 @dataclass
 class RiskResult:
-    risk_level:       str           # clean | warning | high | confirmed
-    risk_score:       float         # 0–100
+    risk_level:       str
+    risk_score:       float
     is_ai_generated:  bool = False
     ai_confidence:    Optional[float] = None
     detected_ai_model: Optional[str] = None
@@ -80,19 +74,13 @@ def _level(score: float) -> str:
 
 
 def _crowdsource_score(unique_sessions: int) -> float:
-    """
-    Logarithmic scale: each additional unique checker adds diminishing points.
-    0 sessions → 0 pts | 2 → 5 | 5 → 14 | 10 → 20 | 50 → 25 (max)
-    """
     if unique_sessions < 2:
         return 0.0
     return min(config.SCORE_CROWDSOURCE_MAX, 8 * math.log2(unique_sessions))
 
 
-def _report_score(verified_reports: int, pending_reports: int) -> float:
-    """Verified reports worth 10 pts each, pending 2 pts. Cap at max."""
-    raw = verified_reports * 10 + pending_reports * 2
-    return min(config.SCORE_REPORTS_MAX, float(raw))
+def _report_score(verified: int, pending: int) -> float:
+    return min(config.SCORE_REPORTS_MAX, float(verified * 10 + pending * 2))
 
 
 # ── Main scorer ───────────────────────────────────────────────────────────────
@@ -106,10 +94,6 @@ class Scorer:
         user_id: Optional[str] = None,
         country_code: Optional[str] = None,
     ) -> RiskResult:
-        """
-        Full scoring pipeline for a face image.
-        Side-effects: logs the check to face_checks and updates face_stats.
-        """
         bd = ScoreBreakdown()
         result = RiskResult(risk_level="clean", risk_score=0.0)
 
@@ -117,83 +101,103 @@ class Scorer:
         face_phash = compute_phash(image_bytes)
         result.face_phash = face_phash
 
-        # ── 1. Extract face embedding ─────────────────────────────────────────
-        embedding = None
-        try:
-            embedding = extract_embedding(image_bytes)
-        except Exception as e:
-            print(f"[scoring] embedding error: {e}")
-
-        # ── 2. AI image detection ─────────────────────────────────────────────
-        ai_result = self._check_ai(img_hash, image_bytes)
-        if ai_result["is_ai"]:
-            bd.ai_flag = config.SCORE_AI_FLAG
+        # ── 1. AI image detection (cached) ────────────────────────────────────
+        ai = self._cached_ai_check(img_hash, image_bytes)
+        if ai["is_ai"]:
+            bd.ai_flag = float(config.SCORE_AI_FLAG)
             result.is_ai_generated = True
-            result.ai_confidence = ai_result["confidence"]
-            result.detected_ai_model = ai_result["model"]
+            result.ai_confidence = ai["confidence"]
+            result.detected_ai_model = ai.get("model_hint")
 
-        # ── 3. DB match ───────────────────────────────────────────────────────
-        db_match = None
+        # ── 2. DB face comparison via Claude Vision ───────────────────────────
+        stored = self._load_profile_images()
         match_type = "no_match"
-        if embedding is not None:
-            with db() as conn:
-                db_match = find_best_match(embedding, conn)
 
-        if db_match:
-            conf = db_match["confidence"]
-            result.match_found = True
-            result.match_confidence = conf
-            result.profile_id = db_match["profile_id"]
-            if conf >= (1 - config.FACE_HIGH_THRESHOLD):
-                bd.db_match = config.SCORE_DB_MATCH_MAX           # 60 pts
-                match_type = "match"
-            else:
-                bd.db_match = config.SCORE_DB_MATCH_MAX * 0.6     # 36 pts for partial
-                match_type = "partial"
+        if stored:
+            cmp = compare_faces_with_claude(image_bytes, stored)
+            if cmp.get("matched") and cmp.get("profile_id"):
+                conf = float(cmp.get("confidence", 0.0))
+                result.match_found = True
+                result.match_confidence = conf
+                result.profile_id = cmp["profile_id"]
+                if conf >= 0.85:
+                    bd.db_match = float(config.SCORE_DB_MATCH_MAX)
+                    match_type = "match"
+                else:
+                    bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
+                    match_type = "partial"
 
-        # ── 4. Crowdsource signal ─────────────────────────────────────────────
-        crowd = self._get_crowd_stats(face_phash)
+        # ── 3. Crowdsource signal ─────────────────────────────────────────────
+        crowd = self._crowd_stats(face_phash)
         result.crowdsource = crowd
         bd.crowdsource = _crowdsource_score(crowd.unique_sessions)
 
-        # ── 5. Reports ────────────────────────────────────────────────────────
+        # ── 4. Reports ────────────────────────────────────────────────────────
         with db() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM reports WHERE face_phash=? AND status='verified'",
-                (face_phash,)
-            ).fetchone()
-            verified = row["n"] if row else 0
-            row2 = conn.execute(
-                "SELECT COUNT(*) AS n FROM reports WHERE face_phash=? AND status='pending'",
-                (face_phash,)
-            ).fetchone()
-            pending = row2["n"] if row2 else 0
-        bd.reports = _report_score(verified, pending)
+            v = conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE face_phash=? AND status='verified'",
+                (face_phash,),
+            ).fetchone()[0]
+            p = conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE face_phash=? AND status='pending'",
+                (face_phash,),
+            ).fetchone()[0]
+        bd.reports = _report_score(v, p)
 
-        # ── 6. Compute total ──────────────────────────────────────────────────
+        # ── 5. Also check reports linked to matched profile ───────────────────
+        if result.profile_id and bd.reports == 0:
+            with db() as conn:
+                v2 = conn.execute(
+                    "SELECT COUNT(*) FROM reports WHERE profile_id=? AND status='verified'",
+                    (result.profile_id,),
+                ).fetchone()[0]
+                p2 = conn.execute(
+                    "SELECT COUNT(*) FROM reports WHERE profile_id=? AND status='pending'",
+                    (result.profile_id,),
+                ).fetchone()[0]
+            bd.reports = _report_score(v2, p2)
+
+        # ── 6. Final score ────────────────────────────────────────────────────
         result.breakdown = bd
         result.risk_score = bd.total
         result.risk_level = _level(bd.total)
 
-        # ── 7. Log check + update stats ───────────────────────────────────────
+        # ── 7. Log check ──────────────────────────────────────────────────────
         with db() as conn:
-            cur = conn.execute(
+            conn.execute(
                 """INSERT INTO face_checks
-                   (face_phash, session_hash, user_id, country_code, result_type,
-                    matched_profile, risk_score)
+                   (face_phash, session_hash, user_id, country_code,
+                    result_type, matched_profile, risk_score)
                    VALUES (?,?,?,?,?,?,?)""",
                 (face_phash, session_hash, user_id, country_code,
-                 match_type if not result.is_ai_generated else "ai_generated",
-                 result.profile_id, result.risk_score)
+                 "ai_generated" if result.is_ai_generated else match_type,
+                 result.profile_id, result.risk_score),
             )
-            check_id = cur.lastrowid
 
         return result
 
-    # ── AI detection ──────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _check_ai(self, img_hash: str, image_bytes: bytes) -> dict:
-        """Check cache first, then run detection."""
+    def _load_profile_images(self) -> list:
+        """Load stored scammer face images for comparison."""
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT fi.profile_id, fi.image_data, p.real_name
+                   FROM face_images fi
+                   LEFT JOIN profiles p ON p.id = fi.profile_id
+                   ORDER BY fi.created_at DESC"""
+            ).fetchall()
+        return [
+            {
+                "profile_id": r["profile_id"],
+                "image_bytes": bytes(r["image_data"]),
+                "name": r["real_name"] or "Unknown",
+            }
+            for r in rows
+        ]
+
+    def _cached_ai_check(self, img_hash: str, image_bytes: bytes) -> dict:
+        """Check AI-detection cache, run detect_ai_image only on cache miss."""
         with db() as conn:
             row = conn.execute(
                 "SELECT * FROM ai_detection_cache WHERE image_hash=?", (img_hash,)
@@ -202,22 +206,21 @@ class Scorer:
             return {
                 "is_ai": bool(row["is_ai_generated"]),
                 "confidence": row["confidence"],
-                "model": row["detected_model"],
+                "model_hint": row["detected_model"],
             }
-        result = _run_ai_detection(image_bytes)
+
+        ai = detect_ai_image(image_bytes)
         with db() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO ai_detection_cache
                    (image_hash, is_ai_generated, confidence, detected_model, detection_method)
                    VALUES (?,?,?,?,?)""",
-                (img_hash, int(result["is_ai"]), result["confidence"],
-                 result["model"], result["method"])
+                (img_hash, int(ai["is_ai"]), ai["confidence"],
+                 ai.get("model_hint", "unknown"), "claude_vision"),
             )
-        return result
+        return ai
 
-    # ── Crowd stats ───────────────────────────────────────────────────────────
-
-    def _get_crowd_stats(self, face_phash: str) -> CrowdsourceSignal:
+    def _crowd_stats(self, face_phash: str) -> CrowdsourceSignal:
         with db() as conn:
             row = conn.execute(
                 "SELECT * FROM face_stats WHERE face_phash=?", (face_phash,)
@@ -231,90 +234,3 @@ class Scorer:
             first_seen=row["first_seen"],
             last_seen=row["last_seen"],
         )
-
-
-# ── AI detection (standalone, without ML deps: metadata + frequency heuristics) ──
-
-def _run_ai_detection(image_bytes: bytes) -> dict:
-    """
-    Multi-signal AI image detector.
-    Runs 3 checks, combines into ensemble confidence.
-    Returns: {is_ai, confidence, model, method}
-    """
-    signals = []
-
-    # Signal 1: EXIF metadata (AI images lack camera EXIF)
-    exif_score = _check_exif(image_bytes)
-    signals.append(exif_score)
-
-    # Signal 2: Color distribution anomalies (GAN artefacts)
-    color_score = _check_color_anomaly(image_bytes)
-    signals.append(color_score)
-
-    # Signal 3: ML-based (optional, requires installed library)
-    ml_score = _check_ml_detector(image_bytes)
-    if ml_score is not None:
-        signals.append(ml_score)
-
-    confidence = sum(signals) / len(signals)
-    return {
-        "is_ai": confidence >= 0.5,
-        "confidence": round(confidence, 3),
-        "model": "unknown" if confidence < 0.5 else "ai_detected",
-        "method": "ensemble",
-    }
-
-
-def _check_exif(image_bytes: bytes) -> float:
-    """No EXIF / no camera model → higher AI probability."""
-    try:
-        from PIL import Image
-        from PIL.ExifTags import TAGS
-        img = Image.open(__import__("io").BytesIO(image_bytes))
-        exif_data = img._getexif()
-        if not exif_data:
-            return 0.6   # likely AI — no EXIF at all
-        tags = {TAGS.get(k, k): v for k, v in exif_data.items()}
-        has_camera = any(k in tags for k in ("Make", "Model", "LensModel"))
-        return 0.15 if has_camera else 0.55
-    except Exception:
-        return 0.5   # unknown
-
-
-def _check_color_anomaly(image_bytes: bytes) -> float:
-    """
-    GAN-generated faces often have unusually uniform skin tone distributions.
-    Heuristic: low variance in hue channel → suspicious.
-    """
-    try:
-        import numpy as np
-        from PIL import Image
-        img = Image.open(__import__("io").BytesIO(image_bytes)).convert("HSV").resize((64, 64))
-        arr = np.array(img)
-        hue_std = arr[:, :, 0].std()
-        sat_mean = arr[:, :, 1].mean()
-        # Very low hue variance with high saturation is a GAN signature
-        if hue_std < 12 and sat_mean > 100:
-            return 0.7
-        if hue_std < 20:
-            return 0.5
-        return 0.25
-    except Exception:
-        return 0.5
-
-
-def _check_ml_detector(image_bytes: bytes) -> float | None:
-    """Use DeepFake-Detection-Challenge model if available."""
-    try:
-        # Optional: use Hugging Face pipeline for deepfake detection
-        from transformers import pipeline
-        detector = pipeline("image-classification", model="umm-maybe/AI-image-detector")
-        import PIL.Image, io
-        img = PIL.Image.open(io.BytesIO(image_bytes))
-        results = detector(img)
-        for r in results:
-            if "artificial" in r["label"].lower() or "ai" in r["label"].lower():
-                return r["score"]
-        return 0.1
-    except Exception:
-        return None   # library not available, skip

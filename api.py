@@ -311,7 +311,7 @@ async def setup_test_profile(
     profile_id = "test-ivan-podnyakov"
 
     # Compute hashes
-    from face import compute_phash, extract_embedding, embedding_to_blob, image_sha256
+    from face import compute_phash
     face_phash = compute_phash(image_bytes)
 
     # Insert profile
@@ -365,33 +365,21 @@ async def setup_test_profile(
                  amount, "USD", reason, "verified")
             )
 
-    # Extract and store face embedding
-    embedding = None
-    try:
-        embedding = extract_embedding(image_bytes)
-    except Exception as e:
-        print(f"[admin] embedding error: {e}")
-
-    if embedding is not None:
-        blob = embedding_to_blob(embedding)
-        dim = len(embedding)
-        with db() as conn:
-            conn.execute("DELETE FROM face_embeddings WHERE profile_id=?", (profile_id,))
-            conn.execute(
-                """INSERT INTO face_embeddings
-                   (profile_id, embedding, embedding_dim, model, face_phash)
-                   VALUES (?,?,?,?,?)""",
-                (profile_id, blob, dim, config.FACE_MODEL, face_phash)
-            )
-        embedding_stored = True
-    else:
-        embedding_stored = False
+    # Store actual image for Claude Vision comparison
+    img_hash = hashlib.sha256(image_bytes).hexdigest()
+    with db() as conn:
+        conn.execute("DELETE FROM face_images WHERE profile_id=?", (profile_id,))
+        conn.execute(
+            """INSERT INTO face_images (profile_id, image_data, image_hash, face_phash)
+               VALUES (?,?,?,?)""",
+            (profile_id, image_bytes, img_hash, face_phash),
+        )
 
     return {
         "status": "ok",
         "profile_id": profile_id,
         "face_phash": face_phash,
-        "embedding_stored": embedding_stored,
+        "image_stored": True,
         "reports_created": 10,
     }
 

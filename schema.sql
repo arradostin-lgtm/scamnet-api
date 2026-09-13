@@ -73,7 +73,21 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_type ON profiles(type);
 CREATE INDEX IF NOT EXISTS idx_profiles_confidence ON profiles(confidence);
 
--- ─── FACE EMBEDDINGS ──────────────────────────────────────────────────────────
+-- ─── FACE IMAGES (actual photos for Claude Vision comparison) ────────────────
+
+CREATE TABLE IF NOT EXISTS face_images (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      TEXT REFERENCES profiles(id) ON DELETE CASCADE,
+    image_data      BLOB NOT NULL,              -- raw image bytes
+    image_hash      TEXT UNIQUE,                -- SHA-256 of image bytes
+    face_phash      TEXT,                       -- perceptual hash
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_img_profile ON face_images(profile_id);
+CREATE INDEX IF NOT EXISTS idx_face_img_hash    ON face_images(image_hash);
+
+-- ─── FACE EMBEDDINGS (legacy — kept for compatibility) ───────────────────────
 
 CREATE TABLE IF NOT EXISTS face_embeddings (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
