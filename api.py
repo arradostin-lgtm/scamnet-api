@@ -396,6 +396,28 @@ async def setup_test_profile(
     }
 
 
+@app.post("/admin/reset-user-limits", tags=["admin"])
+async def reset_user_limits(
+    email: str = Form(...),
+    checks_used: int = Form(0),
+    checks_limit: int = Form(5),
+    admin_key: str = Form("scamnet-test-2026"),
+):
+    """Reset or update a user's check limits by email. For testing only."""
+    if admin_key != os.getenv("ADMIN_KEY", "scamnet-test-2026"):
+        raise HTTPException(403, "Invalid admin key")
+
+    with db() as conn:
+        row = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"User {email} not found")
+        conn.execute(
+            "UPDATE users SET checks_used=?, checks_limit=? WHERE email=?",
+            (checks_used, checks_limit, email)
+        )
+    return {"status": "ok", "email": email, "checks_used": checks_used, "checks_limit": checks_limit}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host=config.API_HOST, port=config.API_PORT, reload=True)
