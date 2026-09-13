@@ -2,7 +2,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+# Load .env only if it exists locally (ignored in Railway — vars set via dashboard)
+_env = Path(__file__).parent / ".env"
+if _env.exists():
+    load_dotenv(_env)
 
 BASE_DIR = Path(__file__).parent.parent
 
