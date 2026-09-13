@@ -79,6 +79,28 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_type ON profiles(type);
 CREATE INDEX IF NOT EXISTS idx_profiles_confidence ON profiles(confidence);
 
+-- ─── REPORTED FACES (photos submitted by victims) ────────────────────────────
+-- These build the crowdsource database organically.
+-- Checked photos are compared against BOTH this table and verified face_images.
+
+CREATE TABLE IF NOT EXISTS reported_faces (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_data      BLOB NOT NULL,
+    image_hash      TEXT UNIQUE,
+    face_phash      TEXT NOT NULL,
+    known_name      TEXT,                       -- alias the scammer used
+    scam_type       TEXT NOT NULL,              -- romance | investment | extortion | fake_job | other
+    platform        TEXT,                       -- where victim met them
+    description     TEXT,
+    amount_lost_usd REAL,
+    reporter_id     TEXT REFERENCES users(id),
+    report_count    INTEGER NOT NULL DEFAULT 1, -- how many victims uploaded same face
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_reported_phash    ON reported_faces(face_phash);
+CREATE INDEX IF NOT EXISTS idx_reported_reporter ON reported_faces(reporter_id);
+
 -- ─── FACE IMAGES (actual photos for Claude Vision comparison) ────────────────
 
 CREATE TABLE IF NOT EXISTS face_images (

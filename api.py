@@ -157,12 +157,34 @@ async def check_face(
 
     # Fetch profile if matched
     profile_data = None
+    match_source = None
+
     if result.profile_id:
-        with db() as conn:
-            row = conn.execute("SELECT * FROM profiles WHERE id=?", (result.profile_id,)).fetchone()
-        if row:
-            d = row_to_dict(row)
-            profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
+        if result.profile_id.startswith("reported:"):
+            # Matched a user-reported face
+            match_source = "reported"
+            rid = int(result.profile_id.split(":")[1])
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT known_name, scam_type, platform, report_count, created_at FROM reported_faces WHERE id=?",
+                    (rid,)
+                ).fetchone()
+            if row:
+                profile_data = {
+                    "known_name": row["known_name"],
+                    "scam_type": row["scam_type"],
+                    "platform": row["platform"],
+                    "report_count": row["report_count"],
+                    "first_reported": row["created_at"],
+                }
+        else:
+            # Matched a verified admin profile
+            match_source = "profile"
+            with db() as conn:
+                row = conn.execute("SELECT * FROM profiles WHERE id=?", (result.profile_id,)).fetchone()
+            if row:
+                d = row_to_dict(row)
+                profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
 
     return {
         "risk_level":       result.risk_level,
@@ -172,6 +194,7 @@ async def check_face(
         "detected_ai_model": result.detected_ai_model,
         "match_found":      result.match_found,
         "match_confidence": round(result.match_confidence, 3) if result.match_confidence else None,
+        "match_source":     match_source,
         "profile":          profile_data,
         "crowdsource": {
             "total_checks":   result.crowdsource.total_checks,
@@ -225,7 +248,86 @@ def check_company(q: str):
     }
 
 
-# ── Report submission ─────────────────────────────────────────────────────────
+# ── Report: submit scammer with photo (victim flow) ──────────────────────────
+
+@app.post("/report/face", tags=["reports"])
+async def report_scammer_face(
+    request: Request,
+    file: UploadFile = File(...),
+    scam_type: str = Form(...),
+    known_name: str = Form(""),
+    platform: str = Form(""),
+    description: str = Form(""),
+    amount_lost_usd: float = Form(0),
+    user = Depends(require_user),
+):
+    """
+    Victim submits a scammer's photo. Does NOT consume a check from the user's quota.
+    Photo is stored in reported_faces for future matching.
+    If same face already reported (by phash), increments report_count.
+    """
+    from face import compute_phash, image_sha256
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Image too large (max 10 MB)")
+
+    face_phash = compute_phash(image_bytes)
+    img_hash = image_sha256(image_bytes)
+
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM reported_faces WHERE image_hash=?", (img_hash,)
+        ).fetchone()
+
+        if existing:
+            # Same exact image uploaded again — just increment count
+            conn.execute(
+                "UPDATE reported_faces SET report_count = report_count + 1 WHERE id=?",
+                (existing["id"],)
+            )
+            reported_id = existing["id"]
+        else:
+            # Check if same face (by phash) already in DB
+            same_phash = conn.execute(
+                "SELECT id FROM reported_faces WHERE face_phash=?", (face_phash,)
+            ).fetchone()
+
+            cur = conn.execute(
+                """INSERT INTO reported_faces
+                   (image_data, image_hash, face_phash, known_name, scam_type,
+                    platform, description, amount_lost_usd, reporter_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (image_bytes, img_hash, face_phash, known_name.strip(), scam_type,
+                 platform, description, amount_lost_usd, user["id"])
+            )
+            reported_id = cur.lastrowid
+
+            if same_phash:
+                # Same face different photo — merge count
+                conn.execute(
+                    "UPDATE reported_faces SET report_count = report_count + 1 WHERE id=?",
+                    (same_phash["id"],)
+                )
+
+        # Also log in reports table for moderation
+        conn.execute(
+            """INSERT INTO reports
+               (face_phash, reporter_id, scam_type, platform,
+                amount_lost_usd, currency, description, status)
+               VALUES (?,?,?,?,?,?,?,'pending')""",
+            (face_phash, user["id"], scam_type, platform,
+             amount_lost_usd, "USD", description)
+        )
+
+    return {
+        "status": "submitted",
+        "face_phash": face_phash,
+        "reported_id": reported_id,
+        "message": "Спасибо. Данные переданы в базу и помогут защитить других пользователей.",
+    }
+
+
+# ── Report submission (JSON, legacy) ──────────────────────────────────────────
 
 @app.post("/report", tags=["reports"])
 async def submit_report(

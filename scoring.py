@@ -179,22 +179,41 @@ class Scorer:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _load_profile_images(self) -> list:
-        """Load stored scammer face images for comparison."""
+        """
+        Load face images for comparison — two sources:
+        1. face_images: admin-verified scammer profiles (high confidence)
+        2. reported_faces: victim-submitted photos (crowdsource signal)
+        """
+        result = []
         with db() as conn:
-            rows = conn.execute(
+            # Verified profiles
+            for r in conn.execute(
                 """SELECT fi.profile_id, fi.image_data, p.real_name
                    FROM face_images fi
                    LEFT JOIN profiles p ON p.id = fi.profile_id
                    ORDER BY fi.created_at DESC"""
-            ).fetchall()
-        return [
-            {
-                "profile_id": r["profile_id"],
-                "image_bytes": bytes(r["image_data"]),
-                "name": r["real_name"] or "Unknown",
-            }
-            for r in rows
-        ]
+            ).fetchall():
+                result.append({
+                    "profile_id": r["profile_id"],
+                    "image_bytes": bytes(r["image_data"]),
+                    "name": r["real_name"] or "Unknown",
+                    "source": "profile",
+                })
+            # User-reported faces (limit to 50 most recent)
+            for r in conn.execute(
+                """SELECT id, image_data, known_name, scam_type, report_count
+                   FROM reported_faces
+                   ORDER BY report_count DESC, created_at DESC LIMIT 50"""
+            ).fetchall():
+                result.append({
+                    "profile_id": f"reported:{r['id']}",
+                    "image_bytes": bytes(r["image_data"]),
+                    "name": r["known_name"] or "Неизвестно",
+                    "source": "reported",
+                    "scam_type": r["scam_type"],
+                    "report_count": r["report_count"],
+                })
+        return result
 
     def _cached_ai_check(self, img_hash: str, image_bytes: bytes) -> dict:
         """Check AI-detection cache, run detect_ai_image only on cache miss."""
