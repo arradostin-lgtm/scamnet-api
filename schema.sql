@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
     google_id   TEXT UNIQUE,                    -- Google sub claim
     plan        TEXT NOT NULL DEFAULT 'free',   -- free | standard | invest
     checks_used INTEGER NOT NULL DEFAULT 0,
-    checks_limit INTEGER NOT NULL DEFAULT 10,
+    checks_limit INTEGER NOT NULL DEFAULT 5,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     last_login  TEXT
 );
