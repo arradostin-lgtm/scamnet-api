@@ -10,7 +10,10 @@ if _env.exists():
 BASE_DIR = Path(__file__).parent.parent
 
 # ── Database ──────────────────────────────────────────────────────────────────
-DB_PATH = os.getenv("SCAMNET_DB", str(BASE_DIR / "db" / "scamnet.db"))
+# On Railway: mount a Volume at /data — DB will persist across deploys.
+# Set SCAMNET_DB=/data/scamnet.db in Railway Variables after creating the Volume.
+_default_db = "/data/scamnet.db" if Path("/data").exists() else str(BASE_DIR / "db" / "scamnet.db")
+DB_PATH = os.getenv("SCAMNET_DB", _default_db)
 
 # ── Google OAuth ──────────────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
