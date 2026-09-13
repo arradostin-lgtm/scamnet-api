@@ -20,13 +20,43 @@ from config import BASE_DIR
 SEED_FILE = Path(__file__).parent.parent / "db" / "seed_profiles.json"
 SEED_PHOTOS = Path(__file__).parent / "seed_photos"
 
+# Hardcoded seed profiles — always seeded regardless of JSON file
+BUILTIN_PROFILES = [
+    {
+        "id": "ivan-podnyakov",
+        "type": "reported",
+        "confidence": "high",
+        "source": "Внутренняя база Scamnet",
+        "source_url": None,
+        "real_name": "Подняков Иван",
+        "known_as": "Иван",
+        "dob": None,
+        "nationality": "RU",
+        "current_status": "at_large",
+        "charges": "Мошенничество (ст. 159 УК РФ)",
+        "sentence": None,
+        "verdict_date": None,
+        "platforms": ["Tinder", "Instagram", "Telegram"],
+        "target_regions": ["RU", "UZ", "KZ"],
+        "known_aliases": ["Иван", "Ivan"],
+        "tags": ["romance", "dating_app"],
+        "victim_count": None,
+        "total_damage_usd": None,
+        "seed_photo": "ivan-podnyakov.jpg",
+    },
+]
+
 
 def seed():
     print("[seed] Initialising database...")
     init_db()
 
+    # Always seed builtin profiles first
+    _seed_profiles(BUILTIN_PROFILES)
+
+    # Then load optional JSON file if present
     if not SEED_FILE.exists():
-        print(f"[seed] No seed file found at {SEED_FILE} — skipping profile import.")
+        print(f"[seed] No seed file at {SEED_FILE} — skipping JSON import.")
         _insert_sample_companies()
         print("[seed] Done.")
         return
@@ -35,6 +65,11 @@ def seed():
         data = json.load(f)
 
     profiles = data if isinstance(data, list) else data.get("profiles", [])
+
+    # Filter out IDs already covered by BUILTIN_PROFILES
+    builtin_ids = {p["id"] for p in BUILTIN_PROFILES}
+    profiles = [p for p in profiles if p.get("id") not in builtin_ids]
+
     inserted = 0
     skipped = 0
 
@@ -96,6 +131,46 @@ def seed():
     print(f"[seed] Profiles: {inserted} inserted, {skipped} already existed.")
     _insert_sample_companies()
     print("[seed] Done.")
+
+
+def _seed_profiles(profiles: list):
+    """Insert profiles from a list of dicts (flat format, no nesting)."""
+    for p in profiles:
+        with db() as conn:
+            existing = conn.execute("SELECT id FROM profiles WHERE id=?", (p["id"],)).fetchone()
+            if not existing:
+                conn.execute(
+                    """INSERT INTO profiles
+                       (id, type, confidence, source, source_url,
+                        real_name, known_as, dob, nationality, current_status,
+                        charges, sentence, verdict_date,
+                        platforms, target_regions, known_aliases, tags,
+                        victim_count, total_damage_usd)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        p["id"], p.get("type","reported"), p.get("confidence","medium"),
+                        p.get("source"), p.get("source_url"),
+                        p.get("real_name"), p.get("known_as"), p.get("dob"),
+                        p.get("nationality"), p.get("current_status"),
+                        p.get("charges"), p.get("sentence"), p.get("verdict_date"),
+                        json.dumps(p.get("platforms",[]), ensure_ascii=False),
+                        json.dumps(p.get("target_regions",[]), ensure_ascii=False),
+                        json.dumps(p.get("known_aliases",[]), ensure_ascii=False),
+                        json.dumps(p.get("tags",[]), ensure_ascii=False),
+                        p.get("victim_count"), p.get("total_damage_usd"),
+                    )
+                )
+                print(f"  [+] {p['id']} — {p.get('known_as') or p.get('real_name','?')}")
+            else:
+                print(f"  [=] {p['id']} already exists")
+
+        photo_file = p.get("seed_photo")
+        if photo_file:
+            photo_path = SEED_PHOTOS / photo_file
+            if photo_path.exists():
+                _seed_face_photo(p["id"], photo_path)
+            else:
+                print(f"  [!] seed_photo '{photo_file}' not found in seed_photos/")
 
 
 def _seed_face_photo(profile_id: str, photo_path: Path):
