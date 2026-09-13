@@ -121,10 +121,10 @@ def me(user = Depends(require_user)):
 async def check_face(
     request: Request,
     file: UploadFile = File(...),
-    user = Depends(current_user),
+    user = Depends(require_user),
 ):
     """
-    Upload a face photo.
+    Upload a face photo. Requires authentication.
     Returns risk level, AI detection result, DB match, crowdsource signal.
     """
     image_bytes = await file.read()
@@ -132,9 +132,8 @@ async def check_face(
         raise HTTPException(413, "Image too large (max 10 MB)")
 
     # Check user quota
-    if user:
-        if user["checks_used"] >= user["checks_limit"]:
-            raise HTTPException(429, "Monthly check limit reached. Upgrade your plan.")
+    if user["checks_used"] >= user["checks_limit"]:
+        raise HTTPException(429, "Monthly check limit reached. Upgrade your plan.")
 
     # Anonymised session identifier
     ip = request.client.host if request.client else "unknown"
