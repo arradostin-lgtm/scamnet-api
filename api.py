@@ -384,6 +384,55 @@ async def setup_test_profile(
     }
 
 
+@app.post("/admin/enrich-profile/{profile_id}", tags=["admin"])
+async def enrich_profile(
+    profile_id: str,
+    admin_key: str = Form("scamnet-test-2026"),
+):
+    """
+    Run OSINT enrichment for a profile: search social media, collect public info.
+    Stores results in profiles.social_links / osint_snippets.
+    """
+    if admin_key != os.getenv("ADMIN_KEY", "scamnet-test-2026"):
+        raise HTTPException(403, "Invalid admin key")
+
+    with db() as conn:
+        row = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Profile not found")
+
+    p = row_to_dict(row)
+    from osint import enrich_profile as run_osint, format_for_profile
+
+    raw = await run_osint(
+        name=p.get("real_name") or p.get("known_as") or "",
+        aliases=p.get("known_aliases") or [],
+        nationality=p.get("nationality"),
+    )
+    formatted = format_for_profile(raw)
+
+    with db() as conn:
+        conn.execute(
+            """UPDATE profiles SET
+               social_links=?, search_urls=?, osint_snippets=?, osint_updated_at=datetime('now')
+               WHERE id=?""",
+            (
+                json.dumps(formatted["social_links"], ensure_ascii=False),
+                json.dumps(formatted["search_urls"], ensure_ascii=False),
+                json.dumps(formatted["snippets"], ensure_ascii=False),
+                profile_id,
+            ),
+        )
+
+    return {
+        "status": "ok",
+        "profile_id": profile_id,
+        "social_links": formatted["social_links"],
+        "search_urls": formatted["search_urls"],
+        "snippets_found": len(formatted["snippets"]),
+    }
+
+
 @app.post("/admin/reset-user-limits", tags=["admin"])
 async def reset_user_limits(
     email: str = Form(...),

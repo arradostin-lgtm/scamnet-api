@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS profiles (
     victim_count    INTEGER,
     total_damage_usd REAL,
 
+    -- OSINT data
+    social_links    TEXT DEFAULT '{}',          -- JSON: {linkedin, instagram, facebook, vk, ...}
+    search_urls     TEXT DEFAULT '{}',          -- JSON: fallback manual search links
+    osint_snippets  TEXT DEFAULT '[]',          -- JSON: text snippets from web search
+    osint_updated_at TEXT,
+
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
