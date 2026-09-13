@@ -294,6 +294,109 @@ def global_stats():
     }
 
 
+# ── Admin: create test profile with face embedding ────────────────────────────
+
+@app.post("/admin/setup-test-profile", tags=["admin"])
+async def setup_test_profile(
+    file: UploadFile = File(...),
+    admin_key: str = "scamnet-test-2026",
+):
+    """
+    Creates a test scammer profile with face embedding and 10 verified reports.
+    Protected by a simple admin key (for testing only).
+    """
+    if admin_key != os.getenv("ADMIN_KEY", "scamnet-test-2026"):
+        raise HTTPException(403, "Invalid admin key")
+
+    image_bytes = await file.read()
+    profile_id = "test-ivan-podnyakov"
+
+    # Compute hashes
+    from face import compute_phash, extract_embedding, embedding_to_blob, image_sha256
+    face_phash = compute_phash(image_bytes)
+
+    # Insert profile
+    with db() as conn:
+        conn.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+        conn.execute(
+            """INSERT INTO profiles
+               (id, type, confidence, real_name, known_as, nationality,
+                current_status, charges, platforms, target_regions,
+                known_aliases, tags, victim_count, source, source_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                profile_id, "reported", "high",
+                "Иван Подняков", "Ivan P.",
+                "RU", "активен",
+                "Брачное мошенничество, вымогательство денег под предлогом помощи",
+                json.dumps(["Tinder", "Instagram", "Telegram"]),
+                json.dumps(["RU", "UZ", "KZ"]),
+                json.dumps(["Ivan Poz", "Иван П."]),
+                json.dumps(["romance", "financial_fraud"]),
+                10,
+                "TEST — профиль создан для демонстрации системы",
+                "",
+            )
+        )
+
+        # Insert 10 verified reports linked to face_phash
+        conn.execute("DELETE FROM reports WHERE face_phash=?", (face_phash,))
+        reasons = [
+            "Познакомился в Tinder, через 2 недели попросил 500$ на «билет»",
+            "Просил деньги на лечение матери, после получения пропал",
+            "Обещал приехать, просил перевод на «визу»",
+            "Вымогал деньги угрозами после обмена фото",
+            "Брал в долг на «бизнес», не вернул",
+            "Просил помочь с таможней для «посылки с подарком»",
+            "Познакомились ВКонтакте, просил деньги на операцию",
+            "Ромэнс-скам через Instagram, потерял 1200$",
+            "Знакомство в баре, через неделю попросил деньги",
+            "Мошенничество через приложение для знакомств, -800$",
+        ]
+        amounts = [500, 300, 200, 0, 1000, 150, 700, 1200, 400, 800]
+        for i, (reason, amount) in enumerate(zip(reasons, amounts)):
+            conn.execute(
+                """INSERT INTO reports
+                   (face_phash, scam_type, platform, amount_lost_usd,
+                    currency, description, status)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (face_phash, "romance",
+                 ["Tinder","ВКонтакте","Instagram","Telegram","Tinder",
+                  "WhatsApp","ВКонтакте","Instagram","Offline","Dating app"][i],
+                 amount, "USD", reason, "verified")
+            )
+
+    # Extract and store face embedding
+    embedding = None
+    try:
+        embedding = extract_embedding(image_bytes)
+    except Exception as e:
+        print(f"[admin] embedding error: {e}")
+
+    if embedding is not None:
+        blob = embedding_to_blob(embedding)
+        dim = len(embedding)
+        with db() as conn:
+            conn.execute("DELETE FROM face_embeddings WHERE profile_id=?", (profile_id,))
+            conn.execute(
+                """INSERT INTO face_embeddings
+                   (profile_id, embedding, embedding_dim, model, face_phash)
+                   VALUES (?,?,?,?,?)""",
+                (profile_id, blob, dim, config.FACE_MODEL, face_phash)
+            )
+        embedding_stored = True
+    else:
+        embedding_stored = False
+
+    return {
+        "status": "ok",
+        "profile_id": profile_id,
+        "face_phash": face_phash,
+        "embedding_stored": embedding_stored,
+        "reports_created": 10,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host=config.API_HOST, port=config.API_PORT, reload=True)
