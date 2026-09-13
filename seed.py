@@ -1,33 +1,12 @@
 """
 Seed the Scamnet database from db/seed_profiles.json.
+Face photos are loaded from backend/seed_photos/<seed_photo> field in the profile.
 
 Usage:
-  python seed.py                    # uses default DB from config
+  python seed.py
   SCAMNET_DB=custom.db python seed.py
-
-JSON format (array of profile objects):
-{
-  "id": "simon-leviev",
-  "type": "convicted",             # convicted | on_trial | reported | suspected
-  "confidence": "high",            # high | medium | low
-  "real_name": "Shimon Hayut",
-  "known_as": "Simon Leviev",
-  "dob": "1990-11-26",
-  "nationality": "IL",
-  "current_status": "released",
-  "charges": "fraud, forgery",
-  "sentence": "5 months (served)",
-  "verdict_date": "2019-12-01",
-  "platforms": ["Tinder", "Instagram"],
-  "target_regions": ["NO", "SE", "DE", "RU"],
-  "known_aliases": ["The Tinder Swindler"],
-  "tags": ["romance", "investment"],
-  "victim_count": 10,
-  "total_damage_usd": 10000000,
-  "source": "Netflix, Haaretz",
-  "source_url": "https://example.com/article"
-}
 """
+import hashlib
 import json
 import sys
 import os
@@ -39,6 +18,7 @@ from database import init_db, db
 from config import BASE_DIR
 
 SEED_FILE = Path(__file__).parent.parent / "db" / "seed_profiles.json"
+SEED_PHOTOS = Path(__file__).parent / "seed_photos"
 
 
 def seed():
@@ -52,48 +32,94 @@ def seed():
         return
 
     with open(SEED_FILE, encoding="utf-8") as f:
-        profiles = json.load(f)
+        data = json.load(f)
 
+    profiles = data if isinstance(data, list) else data.get("profiles", [])
     inserted = 0
     skipped = 0
 
-    with db() as conn:
-        for p in profiles:
+    for p in profiles:
+        ri = p.get("real_identity", {})
+        cr = p.get("criminal_record", {})
+        vi = p.get("victims", {})
+
+        real_name   = ri.get("real_name") or p.get("real_name")
+        known_as    = ri.get("known_as")  or p.get("known_as")
+        dob         = ri.get("dob")       or p.get("dob")
+        nationality = ri.get("nationality") or p.get("nationality")
+        cur_status  = ri.get("current_status") or p.get("current_status")
+        charges     = cr.get("charges")   or p.get("charges")
+        sentence    = cr.get("sentence")  or p.get("sentence")
+        verdict_dt  = cr.get("verdict_date") or p.get("verdict_date")
+        victim_cnt  = vi.get("total_count") or p.get("victim_count")
+        damage      = vi.get("total_amount_usd") or p.get("total_damage_usd")
+
+        with db() as conn:
             existing = conn.execute(
                 "SELECT id FROM profiles WHERE id=?", (p["id"],)
             ).fetchone()
             if existing:
                 skipped += 1
-                continue
-
-            conn.execute(
-                """INSERT INTO profiles
-                   (id, type, confidence, source, source_url,
-                    real_name, known_as, dob, nationality, current_status,
-                    charges, sentence, verdict_date,
-                    platforms, target_regions, known_aliases, tags,
-                    victim_count, total_damage_usd)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    p["id"], p.get("type", "reported"), p.get("confidence", "medium"),
-                    p.get("source"), p.get("source_url"),
-                    p.get("real_name"), p.get("known_as"), p.get("dob"),
-                    p.get("nationality"), p.get("current_status"),
-                    p.get("charges"), p.get("sentence"), p.get("verdict_date"),
-                    json.dumps(p.get("platforms", []), ensure_ascii=False),
-                    json.dumps(p.get("target_regions", []), ensure_ascii=False),
-                    json.dumps(p.get("known_aliases", []), ensure_ascii=False),
-                    json.dumps(p.get("tags", []), ensure_ascii=False),
-                    p.get("victim_count"), p.get("total_damage_usd"),
+            else:
+                conn.execute(
+                    """INSERT INTO profiles
+                       (id, type, confidence, source, source_url,
+                        real_name, known_as, dob, nationality, current_status,
+                        charges, sentence, verdict_date,
+                        platforms, target_regions, known_aliases, tags,
+                        victim_count, total_damage_usd)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        p["id"], p.get("type", "reported"), p.get("confidence", "medium"),
+                        p.get("source"), p.get("source_url"),
+                        real_name, known_as, dob, nationality, cur_status,
+                        charges, sentence, verdict_dt,
+                        json.dumps(p.get("platforms", []), ensure_ascii=False),
+                        json.dumps(p.get("target_regions", []), ensure_ascii=False),
+                        json.dumps(p.get("known_aliases", []), ensure_ascii=False),
+                        json.dumps(p.get("tags", []), ensure_ascii=False),
+                        victim_cnt, damage,
+                    )
                 )
-            )
-            inserted += 1
-            print(f"  [+] {p['id']} — {p.get('known_as') or p.get('real_name', '(unnamed)')}")
+                inserted += 1
+                print(f"  [+] {p['id']} — {known_as or real_name or '(unnamed)'}")
+
+        # Seed face photo if specified and file exists
+        photo_file = p.get("seed_photo")
+        if photo_file:
+            photo_path = SEED_PHOTOS / photo_file
+            if photo_path.exists():
+                _seed_face_photo(p["id"], photo_path)
+            else:
+                print(f"  [!] {p['id']}: seed_photo '{photo_file}' not found in seed_photos/ — skipping face")
 
     print(f"[seed] Profiles: {inserted} inserted, {skipped} already existed.")
-
     _insert_sample_companies()
     print("[seed] Done.")
+
+
+def _seed_face_photo(profile_id: str, photo_path: Path):
+    """Insert face photo into face_images if not already present."""
+    try:
+        from face import compute_phash, image_sha256
+        image_bytes = photo_path.read_bytes()
+        img_hash = image_sha256(image_bytes)
+        face_phash = compute_phash(image_bytes)
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM face_images WHERE image_hash=?", (img_hash,)
+            ).fetchone()
+            if existing:
+                print(f"  [=] {profile_id}: face photo already in DB")
+                return
+            conn.execute(
+                """INSERT INTO face_images (profile_id, image_data, image_hash, face_phash)
+                   VALUES (?,?,?,?)""",
+                (profile_id, image_bytes, img_hash, face_phash)
+            )
+        print(f"  [+] {profile_id}: face photo seeded from {photo_path.name}")
+    except Exception as e:
+        print(f"  [!] {profile_id}: failed to seed face photo — {e}")
 
 
 def _insert_sample_companies():

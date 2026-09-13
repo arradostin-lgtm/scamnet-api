@@ -76,6 +76,11 @@ def require_user(user = Depends(current_user)):
 @app.on_event("startup")
 def startup():
     init_db()
+    try:
+        from seed import seed
+        seed()
+    except Exception as e:
+        print(f"[startup] seed error (non-fatal): {e}")
 
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
