@@ -180,38 +180,24 @@ class Scorer:
 
     def _load_profile_images(self) -> list:
         """
-        Load face images for comparison — two sources:
-        1. face_images: admin-verified scammer profiles (high confidence)
-        2. reported_faces: victim-submitted photos (crowdsource signal)
+        Load verified profile references for visual comparison.
+        Photos are read from disk (seed_photos/) — never stored in DB.
+        Reported faces contribute only to phash/crowdsource signal, not visual comparison.
         """
         result = []
         with db() as conn:
-            # Verified profiles
             for r in conn.execute(
-                """SELECT fi.profile_id, fi.image_data, p.real_name
+                """SELECT fi.profile_id, fi.seed_photo_path, p.real_name
                    FROM face_images fi
                    LEFT JOIN profiles p ON p.id = fi.profile_id
+                   WHERE fi.seed_photo_path IS NOT NULL
                    ORDER BY fi.created_at DESC"""
             ).fetchall():
                 result.append({
                     "profile_id": r["profile_id"],
-                    "image_bytes": bytes(r["image_data"]),
+                    "seed_photo_path": r["seed_photo_path"],
                     "name": r["real_name"] or "Unknown",
                     "source": "profile",
-                })
-            # User-reported faces (limit to 50 most recent)
-            for r in conn.execute(
-                """SELECT id, image_data, known_name, scam_type, report_count
-                   FROM reported_faces
-                   ORDER BY report_count DESC, created_at DESC LIMIT 50"""
-            ).fetchall():
-                result.append({
-                    "profile_id": f"reported:{r['id']}",
-                    "image_bytes": bytes(r["image_data"]),
-                    "name": r["known_name"] or "Неизвестно",
-                    "source": "reported",
-                    "scam_type": r["scam_type"],
-                    "report_count": r["report_count"],
                 })
         return result
 

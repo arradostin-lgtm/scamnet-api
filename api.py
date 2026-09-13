@@ -299,10 +299,10 @@ async def report_scammer_face(
 
             cur = conn.execute(
                 """INSERT INTO reported_faces
-                   (image_data, image_hash, face_phash, known_name, scam_type,
+                   (image_hash, face_phash, known_name, scam_type,
                     platform, description, amount_lost_usd, reporter_id)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (image_bytes, img_hash, face_phash, known_name.strip(), scam_type,
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (img_hash, face_phash, known_name.strip(), scam_type,
                  platform, description, amount_lost_usd, user["id"])
             )
             reported_id = cur.lastrowid
@@ -472,21 +472,21 @@ async def setup_test_profile(
                  amount, "USD", reason, "verified")
             )
 
-    # Store actual image for Claude Vision comparison
+    # Store only hash + phash reference — no raw bytes in DB
     img_hash = hashlib.sha256(image_bytes).hexdigest()
     with db() as conn:
         conn.execute("DELETE FROM face_images WHERE profile_id=?", (profile_id,))
         conn.execute(
-            """INSERT INTO face_images (profile_id, image_data, image_hash, face_phash)
-               VALUES (?,?,?,?)""",
-            (profile_id, image_bytes, img_hash, face_phash),
+            """INSERT INTO face_images (profile_id, image_hash, face_phash)
+               VALUES (?,?,?)""",
+            (profile_id, img_hash, face_phash),
         )
 
     return {
         "status": "ok",
         "profile_id": profile_id,
         "face_phash": face_phash,
-        "image_stored": True,
+        "image_stored": False,
         "reports_created": 10,
     }
 

@@ -79,15 +79,14 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_type ON profiles(type);
 CREATE INDEX IF NOT EXISTS idx_profiles_confidence ON profiles(confidence);
 
--- ─── REPORTED FACES (photos submitted by victims) ────────────────────────────
--- These build the crowdsource database organically.
--- Checked photos are compared against BOTH this table and verified face_images.
+-- ─── REPORTED FACES (crowdsource signal — no photo stored) ───────────────────
+-- Privacy-by-design: uploaded photo is processed in memory then discarded.
+-- Only perceptual hash + metadata kept for matching signal.
 
 CREATE TABLE IF NOT EXISTS reported_faces (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_data      BLOB NOT NULL,
-    image_hash      TEXT UNIQUE,
-    face_phash      TEXT NOT NULL,
+    image_hash      TEXT UNIQUE,                -- SHA-256 of submitted photo (audit dedup)
+    face_phash      TEXT NOT NULL,              -- perceptual hash for matching
     known_name      TEXT,                       -- alias the scammer used
     scam_type       TEXT NOT NULL,              -- romance | investment | extortion | fake_job | other
     platform        TEXT,                       -- where victim met them
@@ -101,14 +100,16 @@ CREATE TABLE IF NOT EXISTS reported_faces (
 CREATE INDEX IF NOT EXISTS idx_reported_phash    ON reported_faces(face_phash);
 CREATE INDEX IF NOT EXISTS idx_reported_reporter ON reported_faces(reporter_id);
 
--- ─── FACE IMAGES (actual photos for Claude Vision comparison) ────────────────
+-- ─── FACE IMAGES (reference records — no raw photo stored in DB) ─────────────
+-- Privacy-by-design: only perceptual hash + disk path kept.
+-- Actual bytes are read from seed_photos/ at comparison time, then discarded.
 
 CREATE TABLE IF NOT EXISTS face_images (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     profile_id      TEXT REFERENCES profiles(id) ON DELETE CASCADE,
-    image_data      BLOB NOT NULL,              -- raw image bytes
-    image_hash      TEXT UNIQUE,                -- SHA-256 of image bytes
-    face_phash      TEXT,                       -- perceptual hash
+    seed_photo_path TEXT,                       -- filename inside backend/seed_photos/
+    image_hash      TEXT UNIQUE,                -- SHA-256 of source image (audit only)
+    face_phash      TEXT,                       -- perceptual hash for fast lookup
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

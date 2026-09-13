@@ -46,18 +46,38 @@ def _media_type(image_bytes: bytes) -> str:
 
 def compare_faces_with_claude(
     query_bytes: bytes,
-    stored_profiles: list,  # [{"profile_id": str, "image_bytes": bytes, "name": str}]
+    stored_profiles: list,  # [{"profile_id": str, "seed_photo_path": str, "name": str}]
+    seed_photos_dir: Optional[str] = None,
 ) -> dict:
     """
-    Compare query photo against stored scammer profile photos using Claude Vision.
+    Compare query photo against scammer profiles using Claude Vision.
+    Profile photos are read from disk (seed_photos_dir) — never stored in DB.
+    query_bytes is processed in memory and never persisted.
     Returns: {matched, profile_id, confidence, reasoning}
     """
-    if not stored_profiles:
+    from pathlib import Path
+
+    if seed_photos_dir is None:
+        seed_photos_dir = str(Path(__file__).parent / "seed_photos")
+    photos_dir = Path(seed_photos_dir)
+
+    loadable = []
+    for prof in stored_profiles[:5]:
+        filename = prof.get("seed_photo_path")
+        if not filename:
+            continue
+        photo_path = photos_dir / filename
+        if not photo_path.exists():
+            continue
+        photo_bytes = photo_path.read_bytes()
+        loadable.append({**prof, "_bytes": photo_bytes})
+
+    if not loadable:
         return {
             "matched": False,
             "profile_id": None,
             "confidence": 0.0,
-            "reasoning": "No profiles in database",
+            "reasoning": "No reference photos available on disk",
         }
 
     content = [
@@ -82,7 +102,7 @@ def compare_faces_with_claude(
         },
     ]
 
-    for i, prof in enumerate(stored_profiles[:5]):
+    for i, prof in enumerate(loadable):
         content.append({
             "type": "text",
             "text": f"\nPROFILE {i + 1} (id={prof['profile_id']}, name={prof.get('name', '?')}):",
@@ -91,8 +111,8 @@ def compare_faces_with_claude(
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": _media_type(prof["image_bytes"]),
-                "data": image_to_base64(prof["image_bytes"]),
+                "media_type": _media_type(prof["_bytes"]),
+                "data": image_to_base64(prof["_bytes"]),
             },
         })
 

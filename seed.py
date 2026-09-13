@@ -174,7 +174,7 @@ def _seed_profiles(profiles: list):
 
 
 def _seed_face_photo(profile_id: str, photo_path: Path):
-    """Insert face photo into face_images if not already present."""
+    """Register face photo reference in face_images (no raw bytes stored)."""
     try:
         from face import compute_phash, image_sha256
         image_bytes = photo_path.read_bytes()
@@ -185,16 +185,16 @@ def _seed_face_photo(profile_id: str, photo_path: Path):
                 "SELECT id FROM face_images WHERE image_hash=?", (img_hash,)
             ).fetchone()
             if existing:
-                print(f"  [=] {profile_id}: face photo already in DB")
+                print(f"  [=] {profile_id}: face reference already in DB")
                 return
             conn.execute(
-                """INSERT INTO face_images (profile_id, image_data, image_hash, face_phash)
+                """INSERT INTO face_images (profile_id, seed_photo_path, image_hash, face_phash)
                    VALUES (?,?,?,?)""",
-                (profile_id, image_bytes, img_hash, face_phash)
+                (profile_id, photo_path.name, img_hash, face_phash)
             )
-        print(f"  [+] {profile_id}: face photo seeded from {photo_path.name}")
+        print(f"  [+] {profile_id}: face reference registered (no photo stored in DB)")
     except Exception as e:
-        print(f"  [!] {profile_id}: failed to seed face photo — {e}")
+        print(f"  [!] {profile_id}: failed to register face — {e}")
 
 
 def _insert_sample_companies():
