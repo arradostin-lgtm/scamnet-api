@@ -467,7 +467,17 @@ async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dic
             "entities":  ["Name recognised from photo"],
         }
     """
-    # SerpApi Google Lens — best quality, sign in with Google
+    # Google Cloud Vision — web detection, accepts base64 directly
+    if GOOGLE_SEARCH_API_KEY:
+        try:
+            result = await _google_vision_web_detect(image_bytes, timeout)
+            if result.get("social") or result.get("found_on") or result.get("entities"):
+                print(f"[osint] google vision: found {len(result.get('found_on',[]))} pages, entities={result.get('entities')}")
+                return result
+        except Exception as e:
+            print(f"[osint] google vision failed: {e}")
+
+    # SerpApi Google Lens fallback (needs image URL, uploads to imgbb first)
     if SERPAPI_KEY:
         try:
             result = await _serpapi_reverse_search(image_bytes, timeout)
@@ -497,19 +507,93 @@ async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dic
         return {"social": {}, "found_on": [], "entities": []}
 
 
-async def _serpapi_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+async def _google_vision_web_detect(image_bytes: bytes, timeout: float = 20.0) -> dict:
     """
-    SerpApi Google Lens reverse image search.
-    Supports direct file upload (no temp hosting needed).
-    Free tier: 100 queries/month. Requires SERPAPI_KEY.
+    Google Cloud Vision API — WEB_DETECTION feature.
+    Finds pages where this face/image appears + extracts entity names.
+    Accepts base64 directly — no image hosting needed.
+    Requires Cloud Vision API enabled in Google Cloud + GOOGLE_SEARCH_API_KEY.
     """
-    import io
+    import base64
+
+    b64 = base64.b64encode(image_bytes).decode()
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(
+            "https://vision.googleapis.com/v1/images:annotate",
+            params={"key": GOOGLE_SEARCH_API_KEY},
+            json={"requests": [{
+                "image": {"content": b64},
+                "features": [{"type": "WEB_DETECTION", "maxResults": 10}],
+            }]},
+        )
+
+    if r.status_code != 200:
+        raise ValueError(f"Google Vision HTTP {r.status_code}: {r.text[:300]}")
+
+    web = r.json().get("responses", [{}])[0].get("webDetection", {})
+
+    social: dict = {}
+    found_on: list = []
+    entities: list = []
+
+    # Entity names — person/celebrity recognition
+    for ent in web.get("webEntities", []):
+        desc = ent.get("description", "")
+        score = ent.get("score", 0)
+        if desc and score > 0.5 and desc not in entities:
+            entities.append(desc)
+
+    # Pages where this exact or similar image appears
+    for page in web.get("pagesWithMatchingImages", []):
+        url = page.get("url", "")
+        title = page.get("pageTitle", "")
+        if url and not _is_noise_url(url):
+            _collect(url, title, social, found_on)
+
+    # Also check visually similar images for social profile photos
+    for img in web.get("visuallySimilarImages", []):
+        url = img.get("url", "")
+        if url and not _is_noise_url(url):
+            for plat in SOCIAL_PLATFORMS:
+                if plat["domain"] in url:
+                    m = re.search(plat["pattern"], url, re.I)
+                    if m and plat["name"] not in social:
+                        social[plat["name"]] = url
+                    break
+
+    return {"social": social, "found_on": found_on[:10], "entities": entities[:5]}
+
+
+async def _serpapi_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+    """
+    SerpApi Google Lens reverse image search.
+    Uploads image to imgbb.com first to get a URL, then passes to SerpApi.
+    Free tier: 100 searches/month. Requires SERPAPI_KEY.
+    """
+    import base64
+
+    # Upload to imgbb to get a temporary URL
+    b64 = base64.b64encode(image_bytes).decode()
+    imgbb_key = os.getenv("IMGBB_API_KEY", "")
+
+    image_url = None
+    if imgbb_key:
+        async with httpx.AsyncClient(timeout=15) as client:
+            up = await client.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": imgbb_key, "image": b64, "expiration": "300"},
+            )
+            if up.status_code == 200:
+                image_url = up.json().get("data", {}).get("url")
+
+    if not image_url:
+        raise ValueError("No image URL for SerpApi (IMGBB_API_KEY not set or upload failed)")
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(
             "https://serpapi.com/search",
-            data={"engine": "google_lens", "api_key": SERPAPI_KEY},
-            files={"file": ("photo.jpg", io.BytesIO(image_bytes), "image/jpeg")},
+            params={"engine": "google_lens", "url": image_url, "api_key": SERPAPI_KEY},
         )
 
     if r.status_code != 200:
@@ -520,20 +604,16 @@ async def _serpapi_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> 
     found_on: list = []
     entities: list = []
 
-    # Visual matches — pages where this face appears
     for item in data.get("visual_matches", []):
         url = item.get("link", "")
-        title = item.get("title", "")
-        source = item.get("source", "")
+        title = item.get("title", "") or item.get("source", "")
         if url and not _is_noise_url(url):
-            _collect(url, title or source, social, found_on)
+            _collect(url, title, social, found_on)
 
-    # Knowledge graph — person recognition (name)
     kg = data.get("knowledge_graph", {})
     if kg.get("title"):
         entities.append(kg["title"])
 
-    # Related content items
     for item in data.get("related_content", []):
         url = item.get("link", "")
         title = item.get("title", "")
