@@ -311,19 +311,17 @@ async def check_face(
                 aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
             except Exception:
                 aliases = []
-            # Enrich aliases from user context and vision
+            # Add user-provided partial name as alias if different from main search_name
             if known_name and known_name != search_name and known_name not in aliases:
                 aliases.append(known_name)
-            if username:
-                aliases.append(username)
-            if company:
-                aliases.append(company)
-            elif vision_info.get("company"):
-                aliases.append(vision_info["company"])
             raw = await search_person(
                 name=search_name,
                 aliases=aliases,
-                nationality=p.get("nationality") or country or None,
+                nationality=p.get("nationality"),
+                country=country or p.get("nationality"),
+                platform_met=platform_met or None,
+                username=username or None,
+                company=company or vision_info.get("company") or None,
                 timeout=18.0,
             )
             osint_data.update(osint_format(raw))

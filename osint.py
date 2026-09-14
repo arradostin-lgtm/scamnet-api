@@ -49,26 +49,39 @@ async def search_person(
     name: str,
     aliases: Optional[list] = None,
     nationality: Optional[str] = None,
+    country: Optional[str] = None,
+    platform_met: Optional[str] = None,
+    username: Optional[str] = None,
+    company: Optional[str] = None,
     timeout: float = 20.0,
 ) -> dict:
     """
-    Main entry point. Search the internet for scam mentions and social profiles.
+    Search the internet for scam mentions and social profiles.
+    All available signals (name, country, platform, company, username) are
+    combined into each query for compound matching — not searched separately.
 
     Returns:
         {
-            "social": {"VK": "url", "Instagram": "url", ...},
-            "mentions": [
-                {"source": "banki.ru", "text": "...", "url": "...", "severity": "high"},
-                ...
-            ],
-            "search_urls": {"google": "...", "vk": "..."},
-            "query_names": ["name", "alias", ...],
+            "social": {"VK": "url", "LinkedIn": "url", ...},
+            "mentions": [{"source": "...", "text": "...", "url": "...", "severity": "..."}, ...],
+            "search_urls": {"google": "...", ...},
+            "query_names": ["name", ...],
         }
     """
     names = [name] + [a for a in (aliases or []) if a and a != name]
+    ctx = _build_context(
+        country=country or nationality,
+        platform_met=platform_met,
+        company=company,
+        username=username,
+    )
 
-    social_task = asyncio.create_task(_find_social_profiles(names[0], timeout=timeout))
-    mentions_task = asyncio.create_task(_find_scam_mentions(names, nationality, timeout=timeout))
+    social_task = asyncio.create_task(
+        _find_social_profiles(names, ctx, username=username, timeout=timeout)
+    )
+    mentions_task = asyncio.create_task(
+        _find_scam_mentions(names, ctx, timeout=timeout)
+    )
 
     try:
         social, mentions = await asyncio.gather(social_task, mentions_task)
@@ -78,37 +91,101 @@ async def search_person(
     return {
         "social": social,
         "mentions": mentions,
-        "search_urls": _build_manual_search_urls(names[0]),
+        "search_urls": _build_manual_search_urls(names[0], ctx),
         "query_names": names,
     }
 
 
-async def _find_social_profiles(name: str, timeout: float = 15.0) -> dict:
-    """Search social media profiles via DuckDuckGo or Google CSE."""
-    social = {}
+def _build_context(
+    country: Optional[str] = None,
+    platform_met: Optional[str] = None,
+    company: Optional[str] = None,
+    username: Optional[str] = None,
+) -> list[str]:
+    """
+    Build a list of context terms to append to search queries.
+    Each term is added verbatim — keeps queries short but precise.
+    """
+    terms = []
+    if country:
+        terms.append(country.strip())
+    if platform_met and platform_met.lower() not in ("другое", "не указано", ""):
+        terms.append(platform_met.strip())
+    if company:
+        terms.append(company.strip())
+    # username used separately — don't add @ noise into site: queries
+    return terms
+
+
+def _name_term(name: str) -> str:
+    """
+    Wrap name in quotes for search, unless it's very short (≤3 chars, e.g. Chinese surnames).
+    Short names need no quotes — surrounding context does the narrowing.
+    """
+    if len(name.replace(" ", "")) <= 3:
+        return name
+    return f'"{name}"'
+
+
+async def _find_social_profiles(
+    names: list[str],
+    ctx: list[str],
+    username: Optional[str],
+    timeout: float = 15.0,
+) -> dict:
+    """
+    Search social media profiles. For each platform, build a compound query:
+      {name} {country} {platform_met} site:{domain}
+    Also run a username-based search if a handle was provided.
+    """
+    social: dict = {}
+    plat_timeout = min(9, timeout)
+    tasks = []
 
     for plat in SOCIAL_PLATFORMS:
-        url = await _search_one_platform(name, plat, timeout=min(8, timeout))
-        if url:
+        # Primary: name + context combined
+        for name in names[:2]:
+            tasks.append((plat, name, _search_one_platform(name, plat, ctx, timeout=plat_timeout)))
+        # Secondary: username search if provided
+        if username:
+            tasks.append((plat, username, _search_one_platform(
+                username, plat, [], timeout=plat_timeout, is_username=True
+            )))
+
+    results = await asyncio.gather(*[t[2] for t in tasks], return_exceptions=True)
+
+    for (plat, _, __), url in zip(tasks, results):
+        if isinstance(url, Exception) or not url:
+            continue
+        if plat["name"] not in social:
             social[plat["name"]] = url
 
     return social
 
 
-async def _search_one_platform(name: str, plat: dict, timeout: float = 8.0) -> Optional[str]:
-    """Search for one social platform profile."""
-    # For LinkedIn use profile-specific path to improve results
-    if plat["name"] == "LinkedIn":
-        query = f'"{name}" site:linkedin.com/in'
-    else:
-        query = f'"{name}" site:{plat["domain"]}'
+async def _search_one_platform(
+    name: str,
+    plat: dict,
+    ctx: list[str],
+    timeout: float = 9.0,
+    is_username: bool = False,
+) -> Optional[str]:
+    """Build and run one compound platform search query."""
+    name_q = _name_term(name) if not is_username else (
+        f'"{name}"' if not name.startswith("@") else f'"{name[1:]}"'
+    )
+
+    site_path = "linkedin.com/in" if plat["name"] == "LinkedIn" else plat["domain"]
+
+    # Combine: name + context terms + site restriction
+    parts = [name_q] + ctx + [f"site:{site_path}"]
+    query = " ".join(parts)
 
     results = await _ddg_search(query, max_results=5, timeout=timeout)
 
     for r in results:
         url = r.get("href", "") or r.get("url", "")
         if re.search(plat["pattern"], url, re.I):
-            # Exclude common non-profile pages
             if any(skip in url for skip in ["/search", "/hashtag", "/explore", "/reel", "/p/"]):
                 continue
             return url
@@ -116,28 +193,38 @@ async def _search_one_platform(name: str, plat: dict, timeout: float = 8.0) -> O
 
 
 async def _find_scam_mentions(
-    names: list,
-    nationality: Optional[str],
+    names: list[str],
+    ctx: list[str],
     timeout: float = 20.0,
 ) -> list:
-    """Search scam forums and review sites for mentions."""
-    mentions = []
+    """
+    Search scam forums and general web for fraud mentions.
+    Context terms (country, platform, company) are appended to every query.
+    """
+    ctx_str = " ".join(ctx)  # e.g. "Узбекистан Telegram"
 
-    # Site-specific searches
     site_tasks = []
     for site in SCAM_SITES:
-        for name in names[:2]:  # limit to first 2 names/aliases
-            q = site["query"].replace("{name}", name)
-            site_tasks.append(_search_site_mention(q, site["name"], site["severity"], timeout=8.0))
+        for name in names[:2]:
+            base_q = site["query"].replace("{name}", name)
+            # Append context if not already in query
+            q = f"{base_q} {ctx_str}".strip() if ctx_str else base_q
+            site_tasks.append(
+                _search_site_mention(q, site["name"], site["severity"], timeout=8.0)
+            )
 
-    # General scam search (not site-restricted)
     for name in names[:2]:
-        general_q = f'"{name}" мошенник обманул жертвы скам fraud'
-        site_tasks.append(_search_site_mention(general_q, "Веб-поиск", "medium", timeout=8.0, general=True))
+        name_q = _name_term(name)
+        ctx_parts = [name_q] + ctx + ["мошенник", "обманул", "скам", "fraud"]
+        general_q = " ".join(ctx_parts)
+        site_tasks.append(
+            _search_site_mention(general_q, "Веб-поиск", "medium", timeout=8.0, general=True)
+        )
 
     results = await asyncio.gather(*site_tasks, return_exceptions=True)
 
-    seen_urls = set()
+    seen_urls: set = set()
+    mentions = []
     for batch in results:
         if isinstance(batch, Exception) or not batch:
             continue
@@ -149,9 +236,8 @@ async def _find_scam_mentions(
                 seen_urls.add(url)
             mentions.append(m)
 
-    # Sort: high severity first, then by source
     mentions.sort(key=lambda m: (0 if m["severity"] == "high" else 1 if m["severity"] == "medium" else 2))
-    return mentions[:12]  # cap at 12
+    return mentions[:12]
 
 
 async def _search_site_mention(
@@ -263,15 +349,19 @@ async def _ddg_lite_search(query: str, max_results: int, timeout: float) -> list
     return results
 
 
-def _build_manual_search_urls(name: str) -> dict:
-    q = name.replace(" ", "+")
-    qe = name.replace(" ", "%20")
+def _build_manual_search_urls(name: str, ctx: Optional[list] = None) -> dict:
+    import urllib.parse
+    ctx_str = " ".join(ctx or [])
+    combined = f"{name} {ctx_str}".strip()
+    q = urllib.parse.quote_plus(combined)
+    qe = urllib.parse.quote(combined)
+    name_q = urllib.parse.quote_plus(name)
     return {
-        "google":    f"https://www.google.com/search?q=%22{qe}%22+мошенник",
-        "vk":        f"https://vk.com/search?c%5Bsection%5D=people&q={q}",
-        "linkedin":  f"https://www.linkedin.com/search/results/people/?keywords={qe}",
-        "instagram": f"https://www.instagram.com/explore/tags/{q}/",
-        "banki":     f"https://www.banki.ru/services/search/?search={qe}",
+        "google":    f"https://www.google.com/search?q=%22{urllib.parse.quote(name)}%22+{urllib.parse.quote_plus(ctx_str)}+мошенник",
+        "vk":        f"https://vk.com/search?c%5Bsection%5D=people&q={name_q}",
+        "linkedin":  f"https://www.linkedin.com/search/results/people/?keywords={q}",
+        "instagram": f"https://www.instagram.com/explore/tags/{name_q}/",
+        "banki":     f"https://www.banki.ru/services/search/?search={name_q}",
     }
 
 
