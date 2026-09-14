@@ -214,6 +214,67 @@ def compare_faces_with_claude(
         }
 
 
+# ── Hive AI: AI-generated image detection ────────────────────────────────────
+
+HIVE_AI_API_KEY = os.getenv("HIVE_AI_API_KEY", "")
+
+
+async def detect_ai_hive(image_bytes: bytes) -> Optional[dict]:
+    """
+    Hive AI: specialized AI-image detector, free tier available.
+    Returns: {is_ai, confidence, model_hint, raw_classes} or None if unavailable.
+    Docs: https://docs.thehive.ai/docs/visual-ai-generated-content-detection
+    """
+    if not HIVE_AI_API_KEY:
+        return None
+    try:
+        import httpx
+        data = base64.b64encode(image_bytes).decode()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://api.thehive.ai/api/v2/task/sync",
+                headers={"Authorization": f"Token {HIVE_AI_API_KEY}"},
+                json={"image": {"format": "base64", "data": data}},
+            )
+            r.raise_for_status()
+            body = r.json()
+
+        # Hive returns status[0].response.output[0].classes
+        classes = (
+            body.get("status", [{}])[0]
+                .get("response", {})
+                .get("output", [{}])[0]
+                .get("classes", [])
+        )
+        if not classes:
+            return None
+
+        # Build score map {label: score}
+        scores = {c["class"]: float(c["score"]) for c in classes}
+
+        ai_score = scores.get("ai_generated", 0.0)
+        not_ai   = scores.get("not_ai_generated", 1.0 - ai_score)
+
+        # Identify which generator
+        gen_labels = ["stable_diffusion", "midjourney", "dall_e", "gan", "deepfake"]
+        model_hint = "unknown"
+        best = 0.0
+        for lbl in gen_labels:
+            s = scores.get(lbl, 0.0)
+            if s > best:
+                best, model_hint = s, lbl.replace("_", "-")
+
+        return {
+            "is_ai":      ai_score >= 0.5,
+            "confidence": round(ai_score, 3),
+            "model_hint": model_hint if ai_score >= 0.5 else "real",
+            "raw_classes": scores,
+        }
+    except Exception as e:
+        print(f"[hive] error: {e}")
+        return None
+
+
 # ── Claude Vision: AI-generated image detection ───────────────────────────────
 
 def detect_ai_image(image_bytes: bytes) -> dict:

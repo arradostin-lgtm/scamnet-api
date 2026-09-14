@@ -38,7 +38,7 @@ from models import (
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
 from osint import search_person, reverse_image_search, format_for_response as osint_format, _domain_label, REVERSE_SEARCH_LINKS
-from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD, analyze_exif
+from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD, analyze_exif, detect_ai_hive
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -241,6 +241,10 @@ async def check_face(
         except Exception as e:
             print(f"[face] InsightFace match error: {e}")
 
+    # Run Hive AI detector in parallel with scorer (non-blocking)
+    import asyncio as _asyncio
+    hive_task = _asyncio.create_task(detect_ai_hive(image_bytes))
+
     result = scorer.score_face(
         image_bytes=image_bytes,
         session_hash=session_hash,
@@ -248,6 +252,14 @@ async def check_face(
         country_code=request.headers.get("CF-IPCountry"),
         insight_match=insight_match,
     )
+
+    hive_result = None
+    try:
+        hive_result = await _asyncio.wait_for(hive_task, timeout=15.0)
+        if hive_result:
+            print(f"[hive] is_ai={hive_result['is_ai']} conf={hive_result['confidence']}")
+    except Exception as e:
+        print(f"[hive] await error: {e}")
 
     # Increment user check counter
     if user:
@@ -388,9 +400,11 @@ async def check_face(
     return {
         "risk_level":        result.risk_level,
         "risk_score":        round(result.risk_score, 1),
-        "is_ai_generated":   result.is_ai_generated,
-        "ai_confidence":     result.ai_confidence,
-        "detected_ai_model": result.detected_ai_model,
+        # Hive AI overrides scorer when available (more accurate specialist model)
+        "is_ai_generated":   hive_result["is_ai"]         if hive_result else result.is_ai_generated,
+        "ai_confidence":     hive_result["confidence"]    if hive_result else result.ai_confidence,
+        "detected_ai_model": hive_result["model_hint"]    if hive_result else result.detected_ai_model,
+        "hive_ai":           hive_result,
         "match_found":       result.match_found,
         "match_confidence":  round(result.match_confidence, 3) if result.match_confidence else None,
         "match_source":      match_source,
