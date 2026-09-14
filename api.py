@@ -252,36 +252,39 @@ async def check_face(
     # Load profiles for Claude face comparison (only if InsightFace missed)
     stored_profiles = scorer._load_profile_images() if not insight_match else []
 
-    # Run all Claude/Hive tasks in parallel — zero sequential blocking
-    hive_task        = _asyncio.create_task(detect_ai_hive(image_bytes))
-    claude_ai_task   = _asyncio.create_task(detect_ai_image(image_bytes)) if not cached_ai else None
-    claude_face_task = _asyncio.create_task(
-        compare_faces_with_claude(image_bytes, stored_profiles)
-    ) if stored_profiles else None
+    # ── Phase 1: run Hive AI + Claude AI-detection in parallel ───────────────────
+    hive_task      = _asyncio.create_task(detect_ai_hive(image_bytes))
+    claude_ai_task = _asyncio.create_task(detect_ai_image(image_bytes)) if not cached_ai else None
 
     hive_result, claude_ai_result, claude_face_result = None, cached_ai, None
     try:
-        tasks = [hive_task]
-        if claude_ai_task:   tasks.append(claude_ai_task)
-        if claude_face_task: tasks.append(claude_face_task)
-        results = await _asyncio.gather(*tasks, return_exceptions=True)
+        phase1_tasks = [hive_task] + ([claude_ai_task] if claude_ai_task else [])
+        phase1 = await _asyncio.gather(*phase1_tasks, return_exceptions=True)
 
-        idx = 0
-        hive_result = results[idx] if not isinstance(results[idx], Exception) else None; idx += 1
+        hive_result = phase1[0] if not isinstance(phase1[0], Exception) else None
         if claude_ai_task:
-            claude_ai_result = results[idx] if not isinstance(results[idx], Exception) else cached_ai; idx += 1
-        if claude_face_task:
-            claude_face_result = results[idx] if not isinstance(results[idx], Exception) else None
+            claude_ai_result = phase1[1] if not isinstance(phase1[1], Exception) else cached_ai
 
         if hive_result:
             print(f"[hive] is_ai={hive_result['is_ai']} conf={hive_result['confidence']}")
         if claude_ai_result and not cached_ai:
             scorer.cache_ai_result(img_hash, claude_ai_result, "claude_vision")
     except Exception as e:
-        print(f"[parallel] Claude/Hive gather error: {e}")
+        print(f"[parallel] Hive/Claude-AI gather error: {e}")
 
     # Hive overrides Claude when available (more accurate specialist)
     ai_result = hive_result or claude_ai_result or {"is_ai": False, "confidence": 0.0, "model_hint": "unknown"}
+
+    # ── Phase 2: Claude face comparison — skip if photo is high-confidence AI ───
+    # If Hive says ≥90% AI-generated, there's no real face to compare
+    ai_is_certain = ai_result.get("is_ai") and ai_result.get("confidence", 0) >= 0.90
+    if stored_profiles and not ai_is_certain:
+        try:
+            claude_face_result = await compare_faces_with_claude(image_bytes, stored_profiles)
+        except Exception as e:
+            print(f"[parallel] Claude face error: {e}")
+    elif ai_is_certain:
+        print(f"[face] skipping Claude face comparison — Hive AI confidence {ai_result['confidence']:.0%}")
 
     result = scorer.score_face(
         image_bytes=image_bytes,

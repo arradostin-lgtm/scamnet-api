@@ -7,6 +7,7 @@ Optional: Google Custom Search (set GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_CX in 
 Returns social profile links and structured scam mentions with source, text, url.
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,42 @@ SOCIAL_PLATFORMS = [
 ]
 
 
+OSINT_CACHE_TTL_HOURS = 24
+
+
+def _osint_cache_key(type_: str, value: str) -> str:
+    return hashlib.sha256(f"{type_}:{value.lower().strip()}".encode()).hexdigest()
+
+
+def _get_osint_cache(cache_key: str) -> Optional[dict]:
+    try:
+        from database import db
+        with db() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM osint_cache WHERE cache_key=? AND expires_at > datetime('now')",
+                (cache_key,),
+            ).fetchone()
+        if row:
+            return json.loads(row["result_json"])
+    except Exception as e:
+        print(f"[osint_cache] read error: {e}")
+    return None
+
+
+def _set_osint_cache(cache_key: str, result: dict) -> None:
+    try:
+        from database import db
+        with db() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO osint_cache (cache_key, result_json, expires_at)
+                   VALUES (?, ?, datetime('now', ?))""",
+                (cache_key, json.dumps(result, ensure_ascii=False),
+                 f"+{OSINT_CACHE_TTL_HOURS} hours"),
+            )
+    except Exception as e:
+        print(f"[osint_cache] write error: {e}")
+
+
 async def search_person(
     name: str,
     aliases: Optional[list] = None,
@@ -95,6 +132,16 @@ async def search_person(
         username=username,
     )
 
+    # ── OSINT cache: check email/phone results from previous identical lookups ──
+    email_cache_key  = _osint_cache_key("email", email)  if email  else None
+    phone_cache_key  = _osint_cache_key("phone", phone)  if phone  else None
+    cached_email_data = _get_osint_cache(email_cache_key)  if email_cache_key  else None
+    cached_phone_data = _get_osint_cache(phone_cache_key)  if phone_cache_key  else None
+    if cached_email_data:
+        print(f"[osint_cache] email cache HIT for {email[:4]}***")
+    if cached_phone_data:
+        print(f"[osint_cache] phone cache HIT for {phone[:4]}***")
+
     social_task = asyncio.create_task(
         _find_social_profiles(names, ctx, username=username, timeout=timeout,
                               prefer_country=country or nationality,
@@ -113,29 +160,30 @@ async def search_person(
     async def _empty_none() -> None:
         return None
 
-    hibp_task = asyncio.create_task(
-        _hibp_check(email, timeout=8.0) if email else _empty_list()
-    )
+    # Email tasks — skip API calls if cached
+    if cached_email_data:
+        hibp_task      = asyncio.create_task(_empty_list())
+        leakcheck_task = asyncio.create_task(_empty_list())
+        ipqs_email_task = asyncio.create_task(_empty_none())
+        hunter_task    = asyncio.create_task(_empty_none())
+        emailrep_task  = asyncio.create_task(_empty_none())
+    else:
+        hibp_task      = asyncio.create_task(_hibp_check(email, timeout=8.0)   if email else _empty_list())
+        leakcheck_task = asyncio.create_task(_leakcheck(email, timeout=8.0)    if email else _empty_list())
+        ipqs_email_task = asyncio.create_task(_ipqs_email(email, timeout=8.0)  if email else _empty_none())
+        hunter_task    = asyncio.create_task(_hunter_email(email, timeout=8.0) if email else _empty_none())
+        emailrep_task  = asyncio.create_task(_emailrep(email, timeout=8.0)     if email else _empty_none())
+
+    # Phone tasks — skip API calls if cached
+    if cached_phone_data:
+        phone_task     = asyncio.create_task(_empty_none())
+        ipqs_phone_task = asyncio.create_task(_empty_none())
+    else:
+        phone_task     = asyncio.create_task(_numverify_lookup(phone, timeout=8.0) if phone else _empty_none())
+        ipqs_phone_task = asyncio.create_task(_ipqs_phone(phone, timeout=8.0)      if phone else _empty_none())
+
     telegram_task = asyncio.create_task(
         _telegram_lookup(username, timeout=8.0) if username else _empty_none()
-    )
-    phone_task = asyncio.create_task(
-        _numverify_lookup(phone, timeout=8.0) if phone else _empty_none()
-    )
-    leakcheck_task = asyncio.create_task(
-        _leakcheck(email, timeout=8.0) if email else _empty_list()
-    )
-    ipqs_email_task = asyncio.create_task(
-        _ipqs_email(email, timeout=8.0) if email else _empty_none()
-    )
-    ipqs_phone_task = asyncio.create_task(
-        _ipqs_phone(phone, timeout=8.0) if phone else _empty_none()
-    )
-    hunter_task = asyncio.create_task(
-        _hunter_email(email, timeout=8.0) if email else _empty_none()
-    )
-    emailrep_task = asyncio.create_task(
-        _emailrep(email, timeout=8.0) if email else _empty_none()
     )
 
     try:
@@ -164,6 +212,32 @@ async def search_person(
         social, mentions, sanctions = {}, [], []
         email_breaches, telegram, phone_info = [], None, None
         leakcheck, ipqs_email, ipqs_phone, hunter_email, emailrep = [], None, None, None, None
+
+    # Apply cached email/phone data (overrides empty gather results)
+    if cached_email_data:
+        email_breaches = cached_email_data.get("email_breaches", [])
+        leakcheck      = cached_email_data.get("leakcheck", [])
+        ipqs_email     = cached_email_data.get("ipqs_email")
+        hunter_email   = cached_email_data.get("hunter_email")
+        emailrep       = cached_email_data.get("emailrep")
+    elif email:
+        # Store fresh email results in cache
+        _set_osint_cache(email_cache_key, {
+            "email_breaches": email_breaches,
+            "leakcheck":      leakcheck,
+            "ipqs_email":     ipqs_email,
+            "hunter_email":   hunter_email,
+            "emailrep":       emailrep,
+        })
+
+    if cached_phone_data:
+        phone_info  = cached_phone_data.get("phone_info")
+        ipqs_phone  = cached_phone_data.get("ipqs_phone")
+    elif phone:
+        _set_osint_cache(phone_cache_key, {
+            "phone_info": phone_info,
+            "ipqs_phone": ipqs_phone,
+        })
 
     # If Telegram confirmed the account exists — add to social dict
     if telegram and telegram.get("exists") and telegram.get("url"):

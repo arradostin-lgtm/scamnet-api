@@ -216,6 +216,17 @@ CREATE TABLE IF NOT EXISTS ai_detection_cache (
     analyzed_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ─── OSINT CACHE (email / phone results, 24h TTL) ────────────────────────────
+
+CREATE TABLE IF NOT EXISTS osint_cache (
+    cache_key   TEXT PRIMARY KEY,               -- SHA-256("email:value" or "phone:value")
+    result_json TEXT NOT NULL,                  -- JSON blob of all API results for this key
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at  TEXT NOT NULL                   -- datetime('now', '+24 hours')
+);
+
+CREATE INDEX IF NOT EXISTS idx_osint_cache_expires ON osint_cache(expires_at);
+
 -- ─── COMPANY / BROKER REPUTATION ─────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS companies (
