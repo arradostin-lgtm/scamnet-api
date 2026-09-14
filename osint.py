@@ -97,7 +97,12 @@ async def _find_social_profiles(name: str, timeout: float = 15.0) -> dict:
 
 async def _search_one_platform(name: str, plat: dict, timeout: float = 8.0) -> Optional[str]:
     """Search for one social platform profile."""
-    query = f'"{name}" site:{plat["domain"]}'
+    # For LinkedIn use profile-specific path to improve results
+    if plat["name"] == "LinkedIn":
+        query = f'"{name}" site:linkedin.com/in'
+    else:
+        query = f'"{name}" site:{plat["domain"]}'
+
     results = await _ddg_search(query, max_results=5, timeout=timeout)
 
     for r in results:
