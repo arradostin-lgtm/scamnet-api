@@ -96,6 +96,7 @@ class Scorer:
         insight_match: Optional[dict] = None,   # from InsightFace pre-computed in api.py
         ai_result: Optional[dict] = None,        # from detect_ai_image / hive — pre-computed async
         claude_match: Optional[dict] = None,     # from compare_faces_with_claude — pre-computed async
+        check_reason: Optional[str] = None,      # user-selected reason: money | investment | romance | job | goods | other
     ) -> RiskResult:
         bd = ScoreBreakdown()
         result = RiskResult(risk_level="clean", risk_score=0.0)
@@ -181,11 +182,11 @@ class Scorer:
             conn.execute(
                 """INSERT INTO face_checks
                    (face_phash, session_hash, user_id, country_code,
-                    result_type, matched_profile, risk_score)
-                   VALUES (?,?,?,?,?,?,?)""",
+                    result_type, matched_profile, risk_score, check_reason)
+                   VALUES (?,?,?,?,?,?,?,?)""",
                 (face_phash, session_hash, user_id, country_code,
                  "ai_generated" if result.is_ai_generated else match_type,
-                 result.profile_id, result.risk_score),
+                 result.profile_id, result.risk_score, check_reason or None),
             )
 
         return result

@@ -123,6 +123,25 @@ def me(user = Depends(require_user)):
     )
 
 
+# ── Aggregate check reasons for a face ───────────────────────────────────────
+
+def _aggregate_reasons(face_phash: str) -> dict:
+    """Return {reason: count} for all non-null reasons logged for this face."""
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT check_reason, COUNT(*) as cnt
+                   FROM face_checks
+                   WHERE face_phash = ? AND check_reason IS NOT NULL
+                   GROUP BY check_reason
+                   ORDER BY cnt DESC""",
+                (face_phash,),
+            ).fetchall()
+        return {r["check_reason"]: r["cnt"] for r in rows}
+    except Exception:
+        return {}
+
+
 # ── Vision: extract identity text from photo ─────────────────────────────────
 
 async def _extract_identity_from_photo(image_bytes: bytes) -> dict:
@@ -200,6 +219,7 @@ async def check_face(
     platform_met: str = Form(""),
     email: str = Form(""),
     phone: str = Form(""),
+    check_reason: str = Form(""),
     user = Depends(require_user),
 ):
     """
@@ -294,6 +314,7 @@ async def check_face(
         insight_match=insight_match,
         ai_result=ai_result,
         claude_match=claude_face_result,
+        check_reason=check_reason or None,
     )
 
     # Increment user check counter
@@ -454,6 +475,7 @@ async def check_face(
             "unique_users":    result.crowdsource.unique_users,
             "first_seen":      result.crowdsource.first_seen,
             "last_seen":       result.crowdsource.last_seen,
+            "reasons":         _aggregate_reasons(result.face_phash),
         },
         "score_breakdown": {
             "db_match":    result.breakdown.db_match,
@@ -488,6 +510,7 @@ async def check_face(
             "platform_met": platform_met,
             "email": email,
             "phone": phone,
+            "check_reason": check_reason,
         }.items() if v},
     }
 

@@ -96,6 +96,12 @@ def _migrate() -> None:
                 CREATE INDEX IF NOT EXISTS idx_reported_reporter ON reported_faces(reporter_id);
             """)
             print("[db] m002: done — photo blobs removed from reported_faces")
+        # m003: face_checks — add check_reason column
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(face_checks)")}
+        if "check_reason" not in cols:
+            conn.execute("ALTER TABLE face_checks ADD COLUMN check_reason TEXT")
+            print("[db] m003: added check_reason to face_checks")
+
         conn.commit()
 
 

@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS face_checks (
     result_type     TEXT,                       -- match | partial | no_match | ai_generated
     matched_profile TEXT REFERENCES profiles(id),
     risk_score      REAL,
+    check_reason    TEXT,                       -- money | investment | romance | job | goods | other
     check_date      TEXT NOT NULL DEFAULT (date('now'))
 );
 
