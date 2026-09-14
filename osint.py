@@ -77,7 +77,8 @@ async def search_person(
     )
 
     social_task = asyncio.create_task(
-        _find_social_profiles(names, ctx, username=username, timeout=timeout)
+        _find_social_profiles(names, ctx, username=username, timeout=timeout,
+                              prefer_country=country or nationality)
     )
     mentions_task = asyncio.create_task(
         _find_scam_mentions(names, ctx, timeout=timeout)
@@ -132,29 +133,33 @@ async def _find_social_profiles(
     ctx: list[str],
     username: Optional[str],
     timeout: float = 15.0,
+    prefer_country: Optional[str] = None,
 ) -> dict:
     """
-    Search social media profiles. For each platform, build a compound query:
-      {name} {country} {platform_met} site:{domain}
-    Also run a username-based search if a handle was provided.
+    Search social media profiles.
+
+    IMPORTANT: DuckDuckGo's site: operator is broken — it returns garbage.
+    Instead we use the domain as a bare keyword (e.g. "linkedin.com/in").
+    Context terms (country, platform_met) are NOT added here — they break DDG.
+    Country is used AFTER results are fetched to pick the best matching profile.
     """
-    social: dict = {}
     plat_timeout = min(9, timeout)
     tasks = []
 
     for plat in SOCIAL_PLATFORMS:
-        # Primary: name + context combined
         for name in names[:2]:
-            tasks.append((plat, name, _search_one_platform(name, plat, ctx, timeout=plat_timeout)))
-        # Secondary: username search if provided
+            tasks.append((plat, _search_one_platform(
+                name, plat, timeout=plat_timeout, prefer_country=prefer_country
+            )))
         if username:
-            tasks.append((plat, username, _search_one_platform(
-                username, plat, [], timeout=plat_timeout, is_username=True
+            tasks.append((plat, _search_one_platform(
+                username, plat, timeout=plat_timeout, is_username=True, prefer_country=prefer_country
             )))
 
-    results = await asyncio.gather(*[t[2] for t in tasks], return_exceptions=True)
+    results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
 
-    for (plat, _, __), url in zip(tasks, results):
+    social: dict = {}
+    for (plat, _), url in zip(tasks, results):
         if isinstance(url, Exception) or not url:
             continue
         if plat["name"] not in social:
@@ -163,31 +168,92 @@ async def _find_social_profiles(
     return social
 
 
+def _normalise_linkedin(url: str) -> str:
+    """Convert uz.linkedin.com/in/X or ru.linkedin.com/in/X → linkedin.com/in/X"""
+    return re.sub(r'https?://[a-z]{2}\.linkedin\.com/', 'https://www.linkedin.com/', url)
+
+
 async def _search_one_platform(
     name: str,
     plat: dict,
-    ctx: list[str],
     timeout: float = 9.0,
     is_username: bool = False,
+    prefer_country: Optional[str] = None,
 ) -> Optional[str]:
-    """Build and run one compound platform search query."""
-    name_q = _name_term(name) if not is_username else (
-        f'"{name}"' if not name.startswith("@") else f'"{name[1:]}"'
-    )
+    """
+    Search for one social platform profile.
+    Uses domain as a keyword (NOT site: operator — broken in DDG).
+    Query: {name} {domain_keyword}
+    e.g.  Поздняков Иван linkedin.com/in
 
-    site_path = "linkedin.com/in" if plat["name"] == "LinkedIn" else plat["domain"]
+    When prefer_country is given, scores country-matching subdomain results higher
+    (e.g. uz.linkedin.com wins over ru.linkedin.com when country=Uzbekistan/Узбекистан).
+    """
+    if is_username:
+        clean = name.lstrip("@")
+        name_q = f'"{clean}"' if len(clean) > 3 else clean
+    else:
+        name_q = _name_term(name)
 
-    # Combine: name + context terms + site restriction
-    parts = [name_q] + ctx + [f"site:{site_path}"]
-    query = " ".join(parts)
+    # Use domain path as keyword — LinkedIn needs /in/ to avoid company pages
+    domain_kw = "linkedin.com/in" if plat["name"] == "LinkedIn" else plat["domain"]
+    query = f"{name_q} {domain_kw}"
 
-    results = await _ddg_search(query, max_results=5, timeout=timeout)
+    # Request more results so profiles further down the list aren't missed
+    results = await _ddg_search(query, max_results=10, timeout=timeout)
 
+    candidates = []
     for r in results:
         url = r.get("href", "") or r.get("url", "")
-        if re.search(plat["pattern"], url, re.I):
-            if any(skip in url for skip in ["/search", "/hashtag", "/explore", "/reel", "/p/"]):
-                continue
+        if not re.search(plat["pattern"], url, re.I):
+            continue
+        if any(skip in url for skip in ["/search", "/hashtag", "/explore", "/reel", "/p/"]):
+            continue
+        candidates.append(url)
+
+    if not candidates:
+        return None
+
+    # If country hint provided, prefer profile from matching country subdomain
+    if prefer_country and plat["name"] == "LinkedIn":
+        best = _pick_by_country(candidates, prefer_country)
+        if best:
+            return _normalise_linkedin(best)
+
+    return _normalise_linkedin(candidates[0]) if plat["name"] == "LinkedIn" else candidates[0]
+
+
+# Country name → LinkedIn subdomain prefix (covers Cyrillic and Latin variants)
+_COUNTRY_TO_SUBDOMAIN = {
+    "узбекистан": "uz", "uzbekistan": "uz",
+    "россия": "ru", "russia": "ru",
+    "казахстан": "kz", "kazakhstan": "kz",
+    "беларусь": "by", "belarus": "by",
+    "украина": "ua", "ukraine": "ua",
+    "германия": "de", "germany": "de",
+    "сша": "us", "usa": "us", "united states": "us",
+    "великобритания": "gb", "uk": "gb",
+    "турция": "tr", "turkey": "tr",
+    "китай": "cn", "china": "cn",
+    "индия": "in", "india": "in",
+    "франция": "fr", "france": "fr",
+    "польша": "pl", "poland": "pl",
+    "азербайджан": "az", "azerbaijan": "az",
+    "грузия": "ge", "georgia": "ge",
+    "армения": "am", "armenia": "am",
+    "кыргызстан": "kg", "kyrgyzstan": "kg",
+    "таджикистан": "tj", "tajikistan": "tj",
+}
+
+
+def _pick_by_country(urls: list, country: str) -> Optional[str]:
+    """Return the first URL whose subdomain matches the country hint, or None."""
+    code = _COUNTRY_TO_SUBDOMAIN.get(country.lower().strip())
+    if not code:
+        return None
+    prefix = f"{code}.linkedin.com"
+    for url in urls:
+        if prefix in url.lower():
             return url
     return None
 
@@ -281,7 +347,7 @@ async def _search_site_mention(
     return mentions
 
 
-async def _ddg_search(query: str, max_results: int = 5, timeout: float = 10.0) -> list:
+async def _ddg_search(query: str, max_results: int = 7, timeout: float = 10.0) -> list:
     """Search DuckDuckGo. Falls back to Google CSE if API key configured."""
 
     # Try Google CSE first if configured
@@ -291,15 +357,27 @@ async def _ddg_search(query: str, max_results: int = 5, timeout: float = 10.0) -
         except Exception:
             pass
 
-    # DuckDuckGo via library
+    # DuckDuckGo: run sync DDGS in thread executor.
+    # AsyncDDGS was removed from duckduckgo_search ≥ 7.x (renamed to ddgs).
+    # The sync DDGS works reliably in a thread pool.
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _sync_search():
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as d:
+                return list(d.text(query, max_results=max_results, region="ru-ru") or [])
+        except Exception:
+            return []
+
     try:
-        from duckduckgo_search import AsyncDDGS
-        async with AsyncDDGS() as ddgs:
-            results = await asyncio.wait_for(
-                ddgs.atext(query, max_results=max_results, region="ru-ru"),
-                timeout=timeout,
-            )
-            return list(results) if results else []
+        results = await asyncio.wait_for(
+            loop.run_in_executor(_executor, _sync_search),
+            timeout=timeout,
+        )
+        return results if results else []
     except asyncio.TimeoutError:
         return []
     except Exception:
