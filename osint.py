@@ -301,6 +301,21 @@ async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dic
         return {"social": {}, "found_on": [], "entities": []}
 
 
+# Domains to skip in reverse search results (Yandex's own services and noise)
+_SKIP_DOMAINS = {
+    "ya.ru", "yandex.ru", "yandex.com", "yandex.by", "yandex.kz", "yandex.ua",
+    "google.com", "google.ru", "bing.com", "mail.ru", "rambler.ru",
+}
+
+
+def _is_noise_url(url: str) -> bool:
+    m = re.search(r'https?://(?:www\.)?([\w\-\.]+)', url)
+    if not m:
+        return True
+    domain = m.group(1).lower()
+    return any(domain == skip or domain.endswith("." + skip) for skip in _SKIP_DOMAINS)
+
+
 async def _yandex_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
     import io
     from bs4 import BeautifulSoup
@@ -329,48 +344,54 @@ async def _yandex_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> d
     if r.status_code not in (200, 301, 302):
         return {"social": {}, "found_on": [], "entities": []}
 
-    from bs4 import BeautifulSoup
     soup = BeautifulSoup(r.text, "html.parser")
 
     social: dict = {}
     found_on: list = []
     entities: list = []
 
-    def _norm_href(href: str) -> str:
+    def _norm(href: str) -> str:
         if href.startswith("//"):
             return "https:" + href
         return href if href.startswith("http") else ""
 
-    # 1. Yandex "Sites where image appears" blocks
-    for sel in [".CbirSites__item", ".cbir-section__sites-item", "[class*='CbirSites']"]:
+    # 1. Targeted Yandex "Sites where image appears" blocks
+    for sel in [
+        ".CbirSites__item",
+        ".cbir-section__sites-item",
+        "[class*='CbirSite']",
+        ".serp-item",
+    ]:
         for item in soup.select(sel):
             a = item.select_one("a[href]")
             if not a:
                 continue
-            href = _norm_href(a.get("href", ""))
-            if not href:
+            href = _norm(a.get("href", ""))
+            if not href or _is_noise_url(href):
                 continue
             title = item.get_text(" ", strip=True)[:200]
             _collect(href, title, social, found_on)
         if found_on:
             break
 
-    # 2. Fallback: scan all links
+    # 2. Fallback: scan all external links, skipping Yandex/noise
     if not found_on:
-        seen = set()
+        seen: set = set()
         for a in soup.select("a[href]"):
-            href = _norm_href(a.get("href", ""))
-            if not href or href in seen:
+            href = _norm(a.get("href", ""))
+            if not href or href in seen or _is_noise_url(href):
                 continue
-            if any(skip in href for skip in ["yandex", "google", "javascript", "mailto"]):
+            if any(x in href for x in ["javascript:", "mailto:", "#"]):
                 continue
             seen.add(href)
             title = a.get_text(" ", strip=True)[:200]
+            if not title or len(title) < 3:
+                continue
             _collect(href, title, social, found_on)
             if len(found_on) >= 10:
                 break
 
-    # 3. Named entity / celebrity block
+    # 3. Named entity / celebrity recognition by Yandex
     for sel in [".CbirCelebrity__title", "[class*='celebrity']", "[class*='Celebrity']"]:
         for el in soup.select(sel):
             t = el.get_text(strip=True)

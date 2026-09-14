@@ -121,6 +121,70 @@ def me(user = Depends(require_user)):
     )
 
 
+# ── Vision: extract identity text from photo ─────────────────────────────────
+
+async def _extract_identity_from_photo(image_bytes: bytes) -> dict:
+    """
+    Use Claude Vision to read names, badges, social handles, and company info
+    visible in the photo. Returns dict with keys: name, username, company, notes.
+    """
+    import anthropic
+    import base64
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {}
+
+    media_type = "image/jpeg"
+    if image_bytes[:4] == b'\x89PNG':
+        media_type = "image/png"
+
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    msg = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64.b64encode(image_bytes).decode(),
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Внимательно изучи фото. Найди любую идентифицирующую информацию:\n"
+                        "1. Имя (с бейджа, подписи, именного знака, водяного знака)\n"
+                        "2. Username или ник в соцсетях\n"
+                        "3. Компания или организация\n"
+                        "4. Телефон или email\n"
+                        "5. Название события или места\n\n"
+                        "Если виден бейдж конференции, прочти его внимательно.\n"
+                        "Ответь ТОЛЬКО JSON без пояснений:\n"
+                        '{"name": "...", "username": null, "company": "...", "phone": null, "email": null, "notes": "..."}\n'
+                        "null для полей, которые не найдены."
+                    ),
+                },
+            ],
+        }],
+    )
+
+    text = (msg.content[0].text or "").strip()
+    try:
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            # Clean up: remove null values
+            return {k: v for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+
 # ── Check: face ───────────────────────────────────────────────────────────────
 
 @app.post("/check/face", tags=["check"])
@@ -190,6 +254,14 @@ async def check_face(
                 d = row_to_dict(row)
                 profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
 
+    # ── Step 1: extract visible text / identity from photo via Claude Vision ──
+    vision_info = {}
+    try:
+        vision_info = await _extract_identity_from_photo(image_bytes)
+        print(f"[vision] extracted: {vision_info}")
+    except Exception as e:
+        print(f"[vision] extraction error: {e}")
+
     # ── OSINT: text search by name (if known) + reverse image search (always) ──
     osint_data = {
         "osint_social": {},
@@ -197,6 +269,7 @@ async def check_face(
         "osint_search_urls": {},
         "osint_entities": [],
         "osint_reverse_links": REVERSE_SEARCH_LINKS,
+        "vision_info": vision_info,
     }
     try:
         p = profile_data or {}
@@ -204,13 +277,21 @@ async def check_face(
             p.get("known_as") or p.get("real_name") or p.get("known_name") or ""
         )
 
-        # 1. Text-based search when name is known
+        # If person not in DB but Vision extracted a name from the photo — use it
+        if not search_name and vision_info.get("name"):
+            search_name = vision_info["name"]
+            print(f"[osint] using vision-extracted name: {search_name}")
+
+        # 1. Text-based search by name
         if search_name and len(search_name) > 3:
             aliases_raw = p.get("known_aliases", "[]") or "[]"
             try:
                 aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
             except Exception:
                 aliases = []
+            # Also add company from vision as search context
+            if vision_info.get("company"):
+                aliases.append(vision_info["company"])
             raw = await search_person(
                 name=search_name,
                 aliases=aliases,
@@ -222,10 +303,8 @@ async def check_face(
         # 2. Reverse image search — always, regardless of DB match
         try:
             rev = await reverse_image_search(image_bytes, timeout=15.0)
-            # Merge social links (don't overwrite text-search results)
             for k, v in rev.get("social", {}).items():
                 osint_data["osint_social"].setdefault(k, v)
-            # Add sites-where-found as OSINT mentions
             for site in rev.get("found_on", []):
                 osint_data["osint_mentions"].append({
                     "source": _domain_label(site["url"]),
@@ -233,7 +312,6 @@ async def check_face(
                     "url":    site["url"],
                     "severity": "medium",
                 })
-            # Named entities Yandex might have recognised
             osint_data["osint_entities"].extend(rev.get("entities", []))
         except Exception as e:
             print(f"[osint] reverse image search error: {e}")
@@ -271,6 +349,7 @@ async def check_face(
         "osint_search_urls":    osint_data["osint_search_urls"],
         "osint_entities":       osint_data.get("osint_entities", []),
         "osint_reverse_links":  osint_data.get("osint_reverse_links", REVERSE_SEARCH_LINKS),
+        "vision_info":          osint_data.get("vision_info", {}),
     }
 
 
