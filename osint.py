@@ -16,6 +16,8 @@ import httpx
 
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+BING_SEARCH_API_KEY = os.getenv("BING_SEARCH_API_KEY", "")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
 # ── Scam forum / review sites to specifically search ──────────────────────────
 SCAM_SITES = [
@@ -455,16 +457,37 @@ REVERSE_SEARCH_LINKS = {
 
 async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
     """
-    Reverse image search: POST photo to Yandex Images, extract social links
-    and sites where the face was found.
+    Reverse image search: find social profiles and web pages where this face appears.
+    Tries Bing Visual Search first (if API key set), then falls back to Yandex.
 
     Returns:
         {
             "social":    {"VK": "url", ...},
             "found_on":  [{"url": "...", "title": "...", "severity": "medium"}],
-            "entities":  ["Name extracted from Yandex"],
+            "entities":  ["Name recognised from photo"],
         }
     """
+    # SerpApi Google Lens — best quality, sign in with Google
+    if SERPAPI_KEY:
+        try:
+            result = await _serpapi_reverse_search(image_bytes, timeout)
+            if result.get("social") or result.get("found_on") or result.get("entities"):
+                print(f"[osint] serpapi lens: found {len(result.get('found_on',[]))} pages, entities={result.get('entities')}")
+                return result
+        except Exception as e:
+            print(f"[osint] serpapi failed: {e}")
+
+    # Bing Visual Search fallback
+    if BING_SEARCH_API_KEY:
+        try:
+            result = await _bing_visual_search(image_bytes, timeout)
+            if result.get("social") or result.get("found_on") or result.get("entities"):
+                print(f"[osint] bing visual search: found {len(result.get('found_on',[]))} pages, entities={result.get('entities')}")
+                return result
+        except Exception as e:
+            print(f"[osint] bing visual search failed: {e}")
+
+    # Yandex fallback
     try:
         return await _yandex_reverse_search(image_bytes, timeout)
     except asyncio.TimeoutError:
@@ -472,6 +495,96 @@ async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dic
     except Exception as e:
         print(f"[osint] yandex reverse search: {e}")
         return {"social": {}, "found_on": [], "entities": []}
+
+
+async def _serpapi_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+    """
+    SerpApi Google Lens reverse image search.
+    Supports direct file upload (no temp hosting needed).
+    Free tier: 100 queries/month. Requires SERPAPI_KEY.
+    """
+    import io
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            "https://serpapi.com/search",
+            data={"engine": "google_lens", "api_key": SERPAPI_KEY},
+            files={"file": ("photo.jpg", io.BytesIO(image_bytes), "image/jpeg")},
+        )
+
+    if r.status_code != 200:
+        raise ValueError(f"SerpApi HTTP {r.status_code}: {r.text[:200]}")
+
+    data = r.json()
+    social: dict = {}
+    found_on: list = []
+    entities: list = []
+
+    # Visual matches — pages where this face appears
+    for item in data.get("visual_matches", []):
+        url = item.get("link", "")
+        title = item.get("title", "")
+        source = item.get("source", "")
+        if url and not _is_noise_url(url):
+            _collect(url, title or source, social, found_on)
+
+    # Knowledge graph — person recognition (name)
+    kg = data.get("knowledge_graph", {})
+    if kg.get("title"):
+        entities.append(kg["title"])
+
+    # Related content items
+    for item in data.get("related_content", []):
+        url = item.get("link", "")
+        title = item.get("title", "")
+        if url and not _is_noise_url(url):
+            _collect(url, title, social, found_on)
+
+    return {"social": social, "found_on": found_on[:10], "entities": entities[:3]}
+
+
+async def _bing_visual_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+    """
+    Microsoft Bing Visual Search API.
+    Finds pages where the image appears + entity recognition (person name).
+    Free tier: 1 000 queries/month. Requires BING_SEARCH_API_KEY.
+    """
+    import io
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            "https://api.bing.microsoft.com/v7.0/images/visualsearch",
+            headers={"Ocp-Apim-Subscription-Key": BING_SEARCH_API_KEY},
+            files={"image": ("photo.jpg", io.BytesIO(image_bytes), "image/jpeg")},
+        )
+
+    if r.status_code != 200:
+        raise ValueError(f"Bing Visual Search HTTP {r.status_code}: {r.text[:200]}")
+
+    data = r.json()
+    social: dict = {}
+    found_on: list = []
+    entities: list = []
+
+    for tag in data.get("tags", []):
+        for action in tag.get("actions", []):
+            action_type = action.get("actionType", "")
+
+            # Entity/celebrity recognition — extracts person's name
+            if action_type == "Entity":
+                display_name = action.get("displayName", "") or action.get("name", "")
+                if display_name and display_name not in entities:
+                    entities.append(display_name)
+
+            # Pages where the exact image appears
+            if action_type in ("PagesIncluding", "VisualSearch"):
+                for item in action.get("data", {}).get("value", []):
+                    url = item.get("hostPageUrl", "")
+                    title = item.get("name", "") or item.get("hostPageDisplayUrl", "")
+                    if url and not _is_noise_url(url):
+                        _collect(url, title, social, found_on)
+
+    return {"social": social, "found_on": found_on[:10], "entities": entities[:3]}
 
 
 # Domains to skip in reverse search results (Yandex's own services and noise)
