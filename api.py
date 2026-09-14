@@ -199,6 +199,7 @@ async def check_face(
     country: str = Form(""),
     platform_met: str = Form(""),
     email: str = Form(""),
+    phone: str = Form(""),
     user = Depends(require_user),
 ):
     """
@@ -356,11 +357,14 @@ async def check_face(
                 username=username or None,
                 company=company or vision_info.get("company") or None,
                 email=email or vision_info.get("email") or None,
+                phone=phone or None,
                 timeout=18.0,
             )
             osint_data.update(osint_format(raw))
             osint_data["sanctions"]      = raw.get("sanctions", [])
             osint_data["email_breaches"] = raw.get("email_breaches", [])
+            osint_data["telegram"]       = raw.get("telegram")
+            osint_data["phone_info"]     = raw.get("phone_info")
 
         # 2. Reverse image search — always, regardless of DB match
         try:
@@ -412,9 +416,11 @@ async def check_face(
         "osint_entities":       osint_data.get("osint_entities", []),
         "osint_reverse_links":  osint_data.get("osint_reverse_links", REVERSE_SEARCH_LINKS),
         "vision_info":          osint_data.get("vision_info", {}),
-        # New: sanctions, HIBP breaches, EXIF signals
+        # New: sanctions, HIBP, Telegram, phone, EXIF
         "sanctions":            osint_data.get("sanctions", []),
         "email_breaches":       osint_data.get("email_breaches", []),
+        "telegram":             osint_data.get("telegram"),
+        "phone_info":           osint_data.get("phone_info"),
         "exif":                 exif_info,
         "user_context": {k: v for k, v in {
             "known_name": known_name,
@@ -423,6 +429,7 @@ async def check_face(
             "country": country,
             "platform_met": platform_met,
             "email": email,
+            "phone": phone,
         }.items() if v},
     }
 

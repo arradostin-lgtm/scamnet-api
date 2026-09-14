@@ -23,6 +23,8 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")        # vk.com/dev → Standalone app → Service token
 OPENSANCTIONS_API_KEY = os.getenv("OPENSANCTIONS_API_KEY", "")  # optional, free tier works without key
 HIBP_API_KEY = os.getenv("HIBP_API_KEY", "")                    # haveibeenpwned.com, $3.50/month
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")        # @BotFather → /newbot → token
+NUMVERIFY_API_KEY = os.getenv("NUMVERIFY_API_KEY", "")          # numverify.com, free 250 req/month
 
 # ── Scam forum / review sites to specifically search ──────────────────────────
 SCAM_SITES = [
@@ -61,6 +63,7 @@ async def search_person(
     username: Optional[str] = None,
     company: Optional[str] = None,
     email: Optional[str] = None,
+    phone: Optional[str] = None,
     timeout: float = 20.0,
 ) -> dict:
     """
@@ -76,6 +79,8 @@ async def search_person(
             "query_names": ["name", ...],
             "sanctions": [{"name": "...", "datasets": [...], "score": 0.9}, ...],
             "email_breaches": ["Adobe", "LinkedIn", ...],
+            "telegram": {"exists": True, "username": "...", "url": "..."} or None,
+            "phone_info": {"valid": True, "country": "...", "line_type": "voip", ...} or None,
         }
     """
     names = [name] + [a for a in (aliases or []) if a and a != name]
@@ -97,24 +102,40 @@ async def search_person(
     sanctions_task = asyncio.create_task(
         _opensanctions_search(name, country=country or nationality, timeout=10.0)
     )
-    async def _empty() -> list:
+
+    async def _empty_list() -> list:
         return []
 
+    async def _empty_none() -> None:
+        return None
+
     hibp_task = asyncio.create_task(
-        _hibp_check(email, timeout=8.0) if email else _empty()
+        _hibp_check(email, timeout=8.0) if email else _empty_list()
+    )
+    telegram_task = asyncio.create_task(
+        _telegram_lookup(username, timeout=8.0) if username else _empty_none()
+    )
+    phone_task = asyncio.create_task(
+        _numverify_lookup(phone, timeout=8.0) if phone else _empty_none()
     )
 
     try:
-        social, mentions, sanctions, email_breaches = await asyncio.gather(
-            social_task, mentions_task, sanctions_task, hibp_task,
+        social, mentions, sanctions, email_breaches, telegram, phone_info = await asyncio.gather(
+            social_task, mentions_task, sanctions_task, hibp_task, telegram_task, phone_task,
             return_exceptions=True,
         )
         if isinstance(social, Exception):           social = {}
         if isinstance(mentions, Exception):         mentions = []
         if isinstance(sanctions, Exception):        sanctions = []
         if isinstance(email_breaches, Exception):   email_breaches = []
+        if isinstance(telegram, Exception):         telegram = None
+        if isinstance(phone_info, Exception):       phone_info = None
     except Exception:
-        social, mentions, sanctions, email_breaches = {}, [], [], []
+        social, mentions, sanctions, email_breaches, telegram, phone_info = {}, [], [], [], None, None
+
+    # If Telegram confirmed the account exists — add to social dict
+    if telegram and telegram.get("exists") and telegram.get("url"):
+        social.setdefault("Telegram", telegram["url"])
 
     return {
         "social": social,
@@ -123,6 +144,8 @@ async def search_person(
         "query_names": names,
         "sanctions": sanctions,
         "email_breaches": email_breaches,
+        "telegram": telegram,
+        "phone_info": phone_info,
     }
 
 
@@ -928,6 +951,95 @@ def _collect(href: str, title: str, social: dict, found_on: list) -> None:
 def _domain_label(url: str) -> str:
     m = re.search(r'https?://(?:www\.)?([\w\-]+\.[\w\-]+)', url)
     return m.group(1) if m else url[:40]
+
+
+async def _telegram_lookup(username: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    Check if a Telegram username exists via Bot API getChat.
+    Returns profile info if the account is public, None if private/not found.
+    Requires TELEGRAM_BOT_TOKEN (@BotFather → /newbot).
+    """
+    if not TELEGRAM_BOT_TOKEN or not username:
+        return None
+
+    clean = username.lstrip("@").strip()
+    if len(clean) < 3:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat",
+                params={"chat_id": f"@{clean}"},
+            )
+        data = r.json()
+        if not data.get("ok"):
+            print(f"[osint] Telegram @{clean}: not found or private")
+            return {"exists": False, "username": clean}
+
+        res = data.get("result", {})
+        info = {
+            "exists": True,
+            "username": res.get("username", clean),
+            "first_name": res.get("first_name"),
+            "last_name": res.get("last_name"),
+            "type": res.get("type"),      # "private" | "group" | "channel"
+            "url": f"https://t.me/{clean}",
+        }
+        print(f"[osint] Telegram @{clean}: found ({res.get('type')})")
+        return info
+    except Exception as e:
+        print(f"[osint] Telegram lookup error: {e}")
+        return None
+
+
+async def _numverify_lookup(phone: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    Validate phone number and get carrier/line type via NumVerify API.
+    Free tier: 250 requests/month. Requires NUMVERIFY_API_KEY.
+    VoIP numbers are a strong fraud signal.
+    """
+    if not NUMVERIFY_API_KEY or not phone:
+        return None
+
+    clean = re.sub(r"[^\d+]", "", phone)
+    if len(clean) < 7:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                "http://apilayer.net/api/validate",
+                params={"access_key": NUMVERIFY_API_KEY, "number": clean, "format": 1},
+            )
+        data = r.json()
+
+        if not data.get("valid"):
+            return {"valid": False, "number": clean}
+
+        line_type = data.get("line_type", "")
+        risk_signals = []
+        if line_type == "voip":
+            risk_signals.append("VoIP номер — часто используется мошенниками")
+        elif line_type == "toll_free":
+            risk_signals.append("Бесплатный номер (800/888)")
+        elif line_type == "premium_rate":
+            risk_signals.append("Премиум-тариф")
+
+        result = {
+            "valid": True,
+            "number": data.get("international_format", clean),
+            "country": data.get("country_name"),
+            "country_code": data.get("country_code"),
+            "carrier": data.get("carrier"),
+            "line_type": line_type,
+            "risk_signals": risk_signals,
+        }
+        print(f"[osint] NumVerify {clean}: {data.get('country_name')}, {line_type}, {data.get('carrier')}")
+        return result
+    except Exception as e:
+        print(f"[osint] NumVerify error: {e}")
+        return None
 
 
 async def _opensanctions_search(
