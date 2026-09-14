@@ -20,5 +20,9 @@ imagehash==4.3.1               # perceptual hashing (phash)
 # ── Claude Vision API (face comparison + AI detection) ───────────────────────
 anthropic>=0.40.0
 
+# ── OSINT / web search ───────────────────────────────────────────────────────
+duckduckgo-search==6.3.5        # free DDG search, no API key needed
+beautifulsoup4==4.12.3          # HTML parsing for scam forum scraping
+
 # ── Environment / secrets ─────────────────────────────────────────────────────
 python-dotenv==1.0.1

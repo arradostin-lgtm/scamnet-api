@@ -36,6 +36,7 @@ from models import (
 )
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
+from osint import search_person, format_for_response as osint_format
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -166,7 +167,6 @@ async def check_face(
 
     if result.profile_id:
         if result.profile_id.startswith("reported:"):
-            # Matched a user-reported face
             match_source = "reported"
             rid = int(result.profile_id.split(":")[1])
             with db() as conn:
@@ -183,7 +183,6 @@ async def check_face(
                     "first_reported": row["created_at"],
                 }
         else:
-            # Matched a verified admin profile
             match_source = "profile"
             with db() as conn:
                 row = conn.execute("SELECT * FROM profiles WHERE id=?", (result.profile_id,)).fetchone()
@@ -191,22 +190,48 @@ async def check_face(
                 d = row_to_dict(row)
                 profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
 
+    # ── OSINT: search internet for scam mentions and social profiles ──────────
+    osint_data = {"osint_social": {}, "osint_mentions": [], "osint_search_urls": {}}
+    try:
+        p = profile_data or {}
+        search_name = (
+            p.get("known_as") or p.get("real_name") or
+            p.get("known_name") or ""
+        )
+        if search_name and len(search_name) > 3:
+            aliases_raw = p.get("known_aliases", "[]") or "[]"
+            try:
+                aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
+            except Exception:
+                aliases = []
+            nationality = p.get("nationality")
+
+            raw = await search_person(
+                name=search_name,
+                aliases=aliases,
+                nationality=nationality,
+                timeout=18.0,
+            )
+            osint_data = osint_format(raw)
+    except Exception as e:
+        print(f"[osint] error: {e}")
+
     return {
-        "risk_level":       result.risk_level,
-        "risk_score":       round(result.risk_score, 1),
-        "is_ai_generated":  result.is_ai_generated,
-        "ai_confidence":    result.ai_confidence,
+        "risk_level":        result.risk_level,
+        "risk_score":        round(result.risk_score, 1),
+        "is_ai_generated":   result.is_ai_generated,
+        "ai_confidence":     result.ai_confidence,
         "detected_ai_model": result.detected_ai_model,
-        "match_found":      result.match_found,
-        "match_confidence": round(result.match_confidence, 3) if result.match_confidence else None,
-        "match_source":     match_source,
-        "profile":          profile_data,
+        "match_found":       result.match_found,
+        "match_confidence":  round(result.match_confidence, 3) if result.match_confidence else None,
+        "match_source":      match_source,
+        "profile":           profile_data,
         "crowdsource": {
-            "total_checks":   result.crowdsource.total_checks,
+            "total_checks":    result.crowdsource.total_checks,
             "unique_sessions": result.crowdsource.unique_sessions,
-            "unique_users":   result.crowdsource.unique_users,
-            "first_seen":     result.crowdsource.first_seen,
-            "last_seen":      result.crowdsource.last_seen,
+            "unique_users":    result.crowdsource.unique_users,
+            "first_seen":      result.crowdsource.first_seen,
+            "last_seen":       result.crowdsource.last_seen,
         },
         "score_breakdown": {
             "db_match":    result.breakdown.db_match,
@@ -215,6 +240,10 @@ async def check_face(
             "ai_flag":     result.breakdown.ai_flag,
             "total":       result.breakdown.total,
         },
+        # OSINT results from internet search
+        "osint_social":      osint_data["osint_social"],
+        "osint_mentions":    osint_data["osint_mentions"],
+        "osint_search_urls": osint_data["osint_search_urls"],
     }
 
 

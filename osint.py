@@ -1,12 +1,10 @@
 """
-OSINT module — collect public social profiles for a known person.
+OSINT module — internet search for scam mentions and social profiles.
 
-Uses Google Custom Search JSON API (100 free queries/day).
-Requires Railway env vars:
-  GOOGLE_SEARCH_API_KEY  — Google API key with Custom Search enabled
-  GOOGLE_SEARCH_CX       — Custom Search Engine ID (searches the whole web)
+Primary: DuckDuckGo (free, no API key).
+Optional: Google Custom Search (set GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_CX in env).
 
-Fallback (no API key): returns direct search URLs for manual lookup.
+Returns social profile links and structured scam mentions with source, text, url.
 """
 import asyncio
 import json
@@ -16,150 +14,264 @@ from typing import Optional
 
 import httpx
 
-SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
-SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
+GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 
-# Platform definitions: domain → url prefix for found profiles
-PLATFORMS = {
-    "linkedin":  {"domain": "linkedin.com/in",  "pattern": r'linkedin\.com/in/[\w\-%]+'},
-    "instagram": {"domain": "instagram.com",     "pattern": r'instagram\.com/([\w\.]+)(?:/|\b)'},
-    "facebook":  {"domain": "facebook.com",      "pattern": r'facebook\.com/(?:people/[\w\.\-]+|[\w\.]+)(?:/|\?|$)'},
-    "vk":        {"domain": "vk.com",            "pattern": r'vk\.com/[\w\.]+'},
-    "telegram":  {"domain": "t.me",              "pattern": r't\.me/[\w]+'},
-    "twitter":   {"domain": "x.com OR twitter.com", "pattern": r'(?:x|twitter)\.com/[\w]+'},
-}
+# ── Scam forum / review sites to specifically search ──────────────────────────
+SCAM_SITES = [
+    {"name": "banki.ru",         "query": 'site:banki.ru "{name}" мошенник',           "severity": "high"},
+    {"name": "Отзовик",          "query": 'site:otzovik.com "{name}" мошенник обман',   "severity": "high"},
+    {"name": "Пикабу",           "query": 'site:pikabu.ru "{name}" мошенник обманул',   "severity": "high"},
+    {"name": "iRecommend",       "query": 'site:irecommend.ru "{name}" мошенник',       "severity": "medium"},
+    {"name": "Отзыв.ру",        "query": 'site:otziv.ru "{name}" мошенник',            "severity": "medium"},
+    {"name": "Судебные решения", "query": 'site:sudact.ru "{name}" мошенничество',      "severity": "high"},
+    {"name": "ГАС Правосудие",  "query": 'site:kad.arbitr.ru "{name}"',               "severity": "high"},
+    {"name": "RomanceScam",      "query": 'site:romancescam.com "{name}"',              "severity": "high"},
+    {"name": "ScamAdviser",      "query": 'site:scamadviser.com "{name}"',              "severity": "medium"},
+    {"name": "StopScam",         "query": 'site:stopscam.ru "{name}" мошенник',        "severity": "high"},
+]
+
+# ── Social media platforms ─────────────────────────────────────────────────────
+SOCIAL_PLATFORMS = [
+    {"name": "VK",         "domain": "vk.com",       "pattern": r'vk\.com/([\w\.]+)(?:\?|/|$)'},
+    {"name": "Instagram",  "domain": "instagram.com", "pattern": r'instagram\.com/([\w\.]+)(?:\?|/|$)'},
+    {"name": "Telegram",   "domain": "t.me",          "pattern": r't\.me/([\w]+)'},
+    {"name": "Facebook",   "domain": "facebook.com",  "pattern": r'facebook\.com/(?:people/[\w\.\-]+|[\w\.]+)'},
+    {"name": "Twitter",    "domain": "x.com",         "pattern": r'(?:x|twitter)\.com/([\w]+)'},
+    {"name": "Одноклассники", "domain": "ok.ru",      "pattern": r'ok\.ru/profile/\d+'},
+    {"name": "TikTok",     "domain": "tiktok.com",    "pattern": r'tiktok\.com/@([\w\.]+)'},
+    {"name": "YouTube",    "domain": "youtube.com",   "pattern": r'youtube\.com/(?:@|channel/|user/)([\w\.\-]+)'},
+]
 
 
-async def enrich_profile(
+async def search_person(
     name: str,
     aliases: Optional[list] = None,
     nationality: Optional[str] = None,
+    timeout: float = 20.0,
 ) -> dict:
     """
-    Search for social profiles of a person.
-    Returns: {
-        "linkedin": "url or None",
-        "instagram": "url or None",
-        "facebook": "url or None",
-        "vk": "url or None",
-        "telegram": "url or None",
-        "twitter": "url or None",
-        "search_urls": {...},   # fallback manual search links
-        "raw_snippets": [...],  # text snippets found about the person
-    }
+    Main entry point. Search the internet for scam mentions and social profiles.
+
+    Returns:
+        {
+            "social": {"VK": "url", "Instagram": "url", ...},
+            "mentions": [
+                {"source": "banki.ru", "text": "...", "url": "...", "severity": "high"},
+                ...
+            ],
+            "search_urls": {"google": "...", "vk": "..."},
+            "query_names": ["name", "alias", ...],
+        }
     """
-    all_names = [name] + (aliases or [])
-    primary = all_names[0]
+    names = [name] + [a for a in (aliases or []) if a and a != name]
 
-    results = {p: None for p in PLATFORMS}
-    results["search_urls"] = _build_search_urls(primary)
-    results["raw_snippets"] = []
-
-    if not SEARCH_API_KEY or not SEARCH_CX:
-        # No API key — return search URL links only
-        return results
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        tasks = [
-            _search_platform(client, primary, platform)
-            for platform in PLATFORMS
-        ]
-        platform_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for platform, found in zip(PLATFORMS.keys(), platform_results):
-        if isinstance(found, Exception):
-            continue
-        if found:
-            results[platform] = found
-
-    # Also do a general search for snippets about the person
-    snippets = await _general_search(primary, nationality)
-    results["raw_snippets"] = snippets
-
-    return results
-
-
-async def _search_platform(client: httpx.AsyncClient, name: str, platform: str) -> Optional[str]:
-    """Search for a person's profile on one platform via Google CSE."""
-    info = PLATFORMS[platform]
-    query = f'"{name}" site:{info["domain"]}'
+    social_task = asyncio.create_task(_find_social_profiles(names[0], timeout=timeout))
+    mentions_task = asyncio.create_task(_find_scam_mentions(names, nationality, timeout=timeout))
 
     try:
-        r = await client.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params={
-                "key": SEARCH_API_KEY,
-                "cx": SEARCH_CX,
-                "q": query,
-                "num": 3,
-            },
-        )
-        data = r.json()
-        items = data.get("items", [])
-        for item in items:
-            link = item.get("link", "")
-            # Validate the URL matches expected pattern
-            if re.search(info["pattern"], link):
-                return link
-            # Also check displayed link
-            if re.search(info["pattern"], item.get("displayLink", "")):
-                return f"https://{item['displayLink']}"
+        social, mentions = await asyncio.gather(social_task, mentions_task)
     except Exception:
-        pass
+        social, mentions = {}, []
+
+    return {
+        "social": social,
+        "mentions": mentions,
+        "search_urls": _build_manual_search_urls(names[0]),
+        "query_names": names,
+    }
+
+
+async def _find_social_profiles(name: str, timeout: float = 15.0) -> dict:
+    """Search social media profiles via DuckDuckGo or Google CSE."""
+    social = {}
+
+    for plat in SOCIAL_PLATFORMS:
+        url = await _search_one_platform(name, plat, timeout=min(8, timeout))
+        if url:
+            social[plat["name"]] = url
+
+    return social
+
+
+async def _search_one_platform(name: str, plat: dict, timeout: float = 8.0) -> Optional[str]:
+    """Search for one social platform profile."""
+    query = f'"{name}" site:{plat["domain"]}'
+    results = await _ddg_search(query, max_results=5, timeout=timeout)
+
+    for r in results:
+        url = r.get("href", "") or r.get("url", "")
+        if re.search(plat["pattern"], url, re.I):
+            # Exclude common non-profile pages
+            if any(skip in url for skip in ["/search", "/hashtag", "/explore", "/reel", "/p/"]):
+                continue
+            return url
     return None
 
 
-async def _general_search(name: str, nationality: Optional[str]) -> list:
-    """General search for public information about the person."""
-    query = f'"{name}"'
-    if nationality:
-        query += f" {nationality}"
+async def _find_scam_mentions(
+    names: list,
+    nationality: Optional[str],
+    timeout: float = 20.0,
+) -> list:
+    """Search scam forums and review sites for mentions."""
+    mentions = []
 
+    # Site-specific searches
+    site_tasks = []
+    for site in SCAM_SITES:
+        for name in names[:2]:  # limit to first 2 names/aliases
+            q = site["query"].replace("{name}", name)
+            site_tasks.append(_search_site_mention(q, site["name"], site["severity"], timeout=8.0))
+
+    # General scam search (not site-restricted)
+    for name in names[:2]:
+        general_q = f'"{name}" мошенник обманул жертвы скам fraud'
+        site_tasks.append(_search_site_mention(general_q, "Веб-поиск", "medium", timeout=8.0, general=True))
+
+    results = await asyncio.gather(*site_tasks, return_exceptions=True)
+
+    seen_urls = set()
+    for batch in results:
+        if isinstance(batch, Exception) or not batch:
+            continue
+        for m in batch:
+            url = m.get("url", "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            mentions.append(m)
+
+    # Sort: high severity first, then by source
+    mentions.sort(key=lambda m: (0 if m["severity"] == "high" else 1 if m["severity"] == "medium" else 2))
+    return mentions[:12]  # cap at 12
+
+
+async def _search_site_mention(
+    query: str,
+    source_name: str,
+    severity: str,
+    timeout: float = 8.0,
+    general: bool = False,
+) -> list:
+    """Run one DDG search and convert results to mention dicts."""
+    results = await _ddg_search(query, max_results=3, timeout=timeout)
+    mentions = []
+    for r in results:
+        url = r.get("href") or r.get("url") or ""
+        title = r.get("title", "")
+        body = r.get("body") or r.get("snippet") or ""
+
+        # Skip irrelevant / low-signal results
+        text = f"{title} {body}".lower()
+        scam_kw = ["мошенник", "обман", "скам", "fraud", "scam", "victim", "жертва", "украл", "кинул"]
+        if general and not any(kw in text for kw in scam_kw):
+            continue
+
+        display_source = source_name
+        if general and url:
+            # Extract domain as source name for general results
+            m = re.search(r'https?://(?:www\.)?([\w\-]+\.\w+)', url)
+            if m:
+                display_source = m.group(1)
+
+        snippet = body[:180].strip() if body else title[:180]
+        if not snippet:
+            continue
+
+        mentions.append({
+            "source": display_source,
+            "text": snippet,
+            "url": url if url.startswith("http") else None,
+            "severity": severity,
+        })
+    return mentions
+
+
+async def _ddg_search(query: str, max_results: int = 5, timeout: float = 10.0) -> list:
+    """Search DuckDuckGo. Falls back to Google CSE if API key configured."""
+
+    # Try Google CSE first if configured
+    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
+        try:
+            return await _google_cse_search(query, max_results, timeout)
+        except Exception:
+            pass
+
+    # DuckDuckGo via library
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={
-                    "key": SEARCH_API_KEY,
-                    "cx": SEARCH_CX,
-                    "q": query,
-                    "num": 5,
-                },
+        from duckduckgo_search import AsyncDDGS
+        async with AsyncDDGS() as ddgs:
+            results = await asyncio.wait_for(
+                ddgs.atext(query, max_results=max_results, region="ru-ru"),
+                timeout=timeout,
             )
-        data = r.json()
-        snippets = []
-        for item in data.get("items", []):
-            snippets.append({
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "link": item.get("link", ""),
-            })
-        return snippets
+            return list(results) if results else []
+    except asyncio.TimeoutError:
+        return []
+    except Exception:
+        pass
+
+    # Last resort: DDG Lite via raw HTTP
+    try:
+        return await _ddg_lite_search(query, max_results, timeout)
     except Exception:
         return []
 
 
-def _build_search_urls(name: str) -> dict:
-    """Build manual search links (no API key needed)."""
+async def _google_cse_search(query: str, max_results: int, timeout: float) -> list:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={"key": GOOGLE_SEARCH_API_KEY, "cx": GOOGLE_SEARCH_CX, "q": query, "num": max_results},
+        )
+        data = r.json()
+        return [
+            {"href": item.get("link"), "title": item.get("title"), "body": item.get("snippet")}
+            for item in data.get("items", [])
+        ]
+
+
+async def _ddg_lite_search(query: str, max_results: int, timeout: float) -> list:
+    """Fallback: DDG HTML endpoint (no JS)."""
+    import urllib.parse
+    url = "https://html.duckduckgo.com/html/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Scamnet/1.0; +https://scamnet.uz)",
+        "Accept-Language": "ru,en;q=0.9",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, data={"q": query, "kl": "ru-ru"}, headers=headers)
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for a in soup.select("a.result__a")[:max_results]:
+        href = a.get("href", "")
+        title = a.get_text(strip=True)
+        snippet_el = a.find_next("a", class_="result__snippet")
+        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+        if href:
+            results.append({"href": href, "title": title, "body": snippet})
+    return results
+
+
+def _build_manual_search_urls(name: str) -> dict:
     q = name.replace(" ", "+")
+    qe = name.replace(" ", "%20")
     return {
-        "linkedin":  f"https://www.linkedin.com/search/results/people/?keywords={q}",
-        "instagram": f"https://www.instagram.com/explore/tags/{q}/",
-        "facebook":  f"https://www.facebook.com/search/people/?q={q}",
+        "google":    f"https://www.google.com/search?q=%22{qe}%22+мошенник",
         "vk":        f"https://vk.com/search?c%5Bsection%5D=people&q={q}",
-        "google":    f"https://www.google.com/search?q=%22{q}%22",
+        "instagram": f"https://www.instagram.com/explore/tags/{q}/",
+        "banki":     f"https://www.banki.ru/services/search/?search={qe}",
     }
 
 
-def format_for_profile(osint_data: dict) -> dict:
-    """Convert raw OSINT results to profile-ready format."""
-    social = {}
-    for platform in PLATFORMS:
-        url = osint_data.get(platform)
-        if url:
-            social[platform] = url
+def format_for_response(osint: dict) -> dict:
+    """Convert search_person() output to API response fields."""
     return {
-        "social_links": social,
-        "search_urls": osint_data.get("search_urls", {}),
-        "snippets": osint_data.get("raw_snippets", []),
+        "osint_social":   osint.get("social", {}),
+        "osint_mentions": osint.get("mentions", []),
+        "osint_search_urls": osint.get("search_urls", {}),
     }

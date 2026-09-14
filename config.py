@@ -55,4 +55,4 @@ RISK_HIGH_MAX       = 79
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://scamnet.uz").split(",")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://itcg.uz/scamnet/")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://scamnet.uz")
