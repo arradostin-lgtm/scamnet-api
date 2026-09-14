@@ -21,7 +21,7 @@ imagehash==4.3.1               # perceptual hashing (phash)
 anthropic>=0.40.0
 
 # ── OSINT / web search ───────────────────────────────────────────────────────
-duckduckgo-search==6.3.5        # free DDG search, no API key needed
+ddgs>=2.0.0                     # DuckDuckGo search (renamed from duckduckgo-search)
 beautifulsoup4==4.12.3          # HTML parsing for scam forum scraping
 
 # ── Environment / secrets ─────────────────────────────────────────────────────

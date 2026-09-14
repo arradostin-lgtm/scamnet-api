@@ -365,30 +365,41 @@ async def _search_site_mention(
 
 
 async def _ddg_search(query: str, max_results: int = 7, timeout: float = 10.0) -> list:
-    """Search DuckDuckGo. Falls back to Google CSE if API key configured."""
+    """Search the web. Uses Google CSE if configured, falls back to DuckDuckGo."""
 
-    # Try Google CSE first if configured
+    # Google CSE — primary (configured with social network sites)
     if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX:
         try:
-            return await _google_cse_search(query, max_results, timeout)
-        except Exception:
-            pass
+            results = await _google_cse_search(query, max_results, timeout)
+            if results:
+                return results
+        except Exception as e:
+            print(f"[search] Google CSE error: {e}")
 
-    # DuckDuckGo: run sync DDGS in thread executor.
-    # AsyncDDGS was removed from duckduckgo_search ≥ 7.x (renamed to ddgs).
-    # The sync DDGS works reliably in a thread pool.
+    # DuckDuckGo fallback — try new package name first, then old
     import concurrent.futures
     loop = asyncio.get_event_loop()
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     def _sync_search():
+        # Try new package name (ddgs)
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
+            with DDGS() as d:
+                return list(d.text(query, max_results=max_results, region="ru-ru") or [])
+        except ImportError:
+            pass
+        # Fall back to old package name (duckduckgo_search)
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                from duckduckgo_search import DDGS
             with DDGS() as d:
                 return list(d.text(query, max_results=max_results, region="ru-ru") or [])
         except Exception:
             return []
 
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         results = await asyncio.wait_for(
             loop.run_in_executor(_executor, _sync_search),
