@@ -283,14 +283,26 @@ async def check_face(
             p.get("known_as") or p.get("real_name") or p.get("known_name") or ""
         )
 
-        # User-provided name has second priority (after DB, before vision)
-        if not search_name and known_name:
-            search_name = known_name
-            print(f"[osint] using user-provided name: {search_name}")
-        # Vision-extracted name is last fallback
-        elif not search_name and vision_info.get("name"):
-            search_name = vision_info["name"]
-            print(f"[osint] using vision-extracted name: {search_name}")
+        if not search_name:
+            v_name = vision_info.get("name", "")
+            u_name = known_name or ""
+            # If vision extracted a full name that contains the user-provided name, prefer it
+            if v_name and u_name and u_name.lower() in v_name.lower():
+                search_name = v_name
+                print(f"[osint] vision name '{v_name}' contains user hint '{u_name}', using vision")
+            elif v_name and u_name:
+                # Both present but different — combine: user name + vision name as alias
+                search_name = v_name
+                if u_name not in [v_name]:
+                    # user_provided will be added as an alias below
+                    pass
+                print(f"[osint] using vision name + user hint: {search_name}")
+            elif v_name:
+                search_name = v_name
+                print(f"[osint] using vision-extracted name: {search_name}")
+            elif u_name:
+                search_name = u_name
+                print(f"[osint] using user-provided name: {search_name}")
 
         # 1. Text-based search by name
         if search_name and len(search_name) > 3:
@@ -300,6 +312,8 @@ async def check_face(
             except Exception:
                 aliases = []
             # Enrich aliases from user context and vision
+            if known_name and known_name != search_name and known_name not in aliases:
+                aliases.append(known_name)
             if username:
                 aliases.append(username)
             if company:
