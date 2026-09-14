@@ -174,25 +174,32 @@ def _seed_profiles(profiles: list):
 
 
 def _seed_face_photo(profile_id: str, photo_path: Path):
-    """Register face photo reference in face_images (no raw bytes stored)."""
+    """Register face photo reference in face_images and index into Rekognition."""
     try:
-        from face import compute_phash, image_sha256
+        from face import compute_phash, image_sha256, rek_index_face
         image_bytes = photo_path.read_bytes()
         img_hash = image_sha256(image_bytes)
         face_phash = compute_phash(image_bytes)
+
+        already_in_db = False
         with db() as conn:
             existing = conn.execute(
                 "SELECT id FROM face_images WHERE image_hash=?", (img_hash,)
             ).fetchone()
             if existing:
                 print(f"  [=] {profile_id}: face reference already in DB")
-                return
-            conn.execute(
-                """INSERT INTO face_images (profile_id, seed_photo_path, image_hash, face_phash)
-                   VALUES (?,?,?,?)""",
-                (profile_id, photo_path.name, img_hash, face_phash)
-            )
-        print(f"  [+] {profile_id}: face reference registered (no photo stored in DB)")
+                already_in_db = True
+            else:
+                conn.execute(
+                    """INSERT INTO face_images (profile_id, seed_photo_path, image_hash, face_phash)
+                       VALUES (?,?,?,?)""",
+                    (profile_id, photo_path.name, img_hash, face_phash)
+                )
+                print(f"  [+] {profile_id}: face reference registered (no photo stored in DB)")
+
+        # Always attempt Rekognition indexing — idempotent, safe to re-run
+        rek_index_face(image_bytes, profile_id)
+
     except Exception as e:
         print(f"  [!] {profile_id}: failed to register face — {e}")
 

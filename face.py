@@ -420,3 +420,107 @@ def _local_ai_heuristic(image_bytes: bytes) -> float:
         signals.append(0.5)
 
     return sum(signals) / len(signals)
+
+
+# ── AWS Rekognition Face Search ───────────────────────────────────────────────
+
+_REK_COLLECTION = os.getenv("REKOGNITION_COLLECTION", "scamnet-faces")
+_AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
+
+
+def _rek_client():
+    """Return a boto3 Rekognition client if AWS creds are configured."""
+    import boto3
+    key = os.getenv("AWS_ACCESS_KEY_ID", "")
+    secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    if not key or not secret:
+        return None
+    return boto3.client(
+        "rekognition",
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        region_name=_AWS_REGION,
+    )
+
+
+def ensure_rek_collection() -> bool:
+    """Create the Rekognition face collection if it doesn't exist. Returns True on success."""
+    rek = _rek_client()
+    if rek is None:
+        print("[rekognition] No AWS credentials — skipping collection init")
+        return False
+    try:
+        rek.create_collection(CollectionId=_REK_COLLECTION)
+        print(f"[rekognition] Created collection: {_REK_COLLECTION}")
+    except rek.exceptions.ResourceAlreadyExistsException:
+        print(f"[rekognition] Collection already exists: {_REK_COLLECTION}")
+    except Exception as e:
+        print(f"[rekognition] ensure_collection error: {e}")
+        return False
+    return True
+
+
+def rek_index_face(image_bytes: bytes, profile_id: str) -> Optional[str]:
+    """
+    Index a face photo into the Rekognition collection.
+    ExternalImageId = profile_id (e.g. "SC-001").
+    Returns the assigned FaceId, or None on failure.
+    """
+    rek = _rek_client()
+    if rek is None:
+        return None
+    try:
+        resp = rek.index_faces(
+            CollectionId=_REK_COLLECTION,
+            Image={"Bytes": image_bytes},
+            ExternalImageId=profile_id,
+            MaxFaces=1,
+            QualityFilter="AUTO",
+            DetectionAttributes=[],
+        )
+        records = resp.get("FaceRecords", [])
+        if records:
+            face_id = records[0]["Face"]["FaceId"]
+            print(f"[rekognition] Indexed face for {profile_id}: {face_id}")
+            return face_id
+        unindexed = resp.get("UnindexedFaces", [])
+        if unindexed:
+            reason = unindexed[0].get("Reasons", [])
+            print(f"[rekognition] Face not indexed for {profile_id}: {reason}")
+        return None
+    except Exception as e:
+        print(f"[rekognition] index_face error for {profile_id}: {e}")
+        return None
+
+
+def rek_search_face(image_bytes: bytes, threshold: float = 80.0) -> Optional[dict]:
+    """
+    Search for a matching face in the Rekognition collection.
+    threshold: 0–100, Amazon similarity confidence.
+    Returns {"profile_id": str, "face_id": str, "similarity": float 0-1} or None.
+    """
+    rek = _rek_client()
+    if rek is None:
+        return None
+    try:
+        resp = rek.search_faces_by_image(
+            CollectionId=_REK_COLLECTION,
+            Image={"Bytes": image_bytes},
+            MaxFaces=1,
+            FaceMatchThreshold=threshold,
+        )
+        matches = resp.get("FaceMatches", [])
+        if not matches:
+            return None
+        top = matches[0]
+        return {
+            "profile_id": top["Face"]["ExternalImageId"],
+            "face_id":    top["Face"]["FaceId"],
+            "similarity": round(top["Similarity"] / 100.0, 3),
+        }
+    except rek.exceptions.InvalidParameterException:
+        # No face detected in the query image
+        return None
+    except Exception as e:
+        print(f"[rekognition] search_face error: {e}")
+        return None

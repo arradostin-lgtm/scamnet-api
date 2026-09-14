@@ -84,6 +84,11 @@ def startup():
         seed()
     except Exception as e:
         print(f"[startup] seed error (non-fatal): {e}")
+    try:
+        from face import ensure_rek_collection
+        ensure_rek_collection()
+    except Exception as e:
+        print(f"[startup] Rekognition init error (non-fatal): {e}")
 
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
@@ -240,11 +245,18 @@ async def check_face(
     from datetime import date
     session_hash = hashlib.sha256(f"{ip}{ua}{date.today()}".encode()).hexdigest()
 
-    # ── InsightFace: compute embedding and match against known profiles ──────────
-    face_emb = compute_face_embedding(image_bytes)
-    insight_match = None   # {"profile_id": str, "similarity": float}
+    import asyncio as _asyncio
+    from face import image_sha256 as _img_hash, rek_search_face
 
-    if face_emb is not None:
+    img_hash = _img_hash(image_bytes)
+
+    # ── Rekognition + InsightFace: run face searches in parallel ─────────────────
+    face_emb = compute_face_embedding(image_bytes)
+
+    async def _insight_search():
+        """InsightFace embedding match against face_embeddings table."""
+        if face_emb is None:
+            return None
         try:
             with db() as conn:
                 rows = conn.execute(
@@ -256,20 +268,46 @@ async def check_face(
                 if sim > best_sim:
                     best_sim, best_pid = sim, row["profile_id"]
             if best_sim >= FACE_MATCH_THRESHOLD:
-                insight_match = {"profile_id": best_pid, "similarity": round(best_sim, 3)}
                 print(f"[face] InsightFace match: {best_pid} sim={best_sim:.3f}")
+                return {"profile_id": best_pid, "similarity": round(best_sim, 3)}
         except Exception as e:
             print(f"[face] InsightFace match error: {e}")
+        return None
 
-    import asyncio as _asyncio
-    from face import image_sha256 as _img_hash
+    async def _rek_search():
+        """AWS Rekognition face search (runs in thread pool — boto3 is sync)."""
+        try:
+            loop = _asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, rek_search_face, image_bytes)
+            if result:
+                print(f"[rekognition] Match: {result['profile_id']} sim={result['similarity']:.3f}")
+            return result
+        except Exception as e:
+            print(f"[rekognition] async search error: {e}")
+            return None
 
-    img_hash = _img_hash(image_bytes)
+    # Run Rekognition + InsightFace in parallel
+    rek_result, insight_result = await _asyncio.gather(
+        _rek_search(), _insight_search(), return_exceptions=False
+    )
+
+    # Pick the best match: prefer Rekognition (cloud-grade model) when available
+    face_match_engine = None
+    if rek_result and (not insight_result or rek_result["similarity"] >= insight_result["similarity"]):
+        insight_match = rek_result
+        face_match_engine = "rekognition"
+        print(f"[face] Using Rekognition match: {insight_match['profile_id']}")
+    elif insight_result:
+        insight_match = insight_result
+        face_match_engine = "insightface"
+        print(f"[face] Using InsightFace match: {insight_match['profile_id']}")
+    else:
+        insight_match = None
 
     # Check AI cache before launching async tasks
     cached_ai = scorer.get_cached_ai(img_hash)
 
-    # Load profiles for Claude face comparison (only if InsightFace missed)
+    # Load profiles for Claude face comparison (only if both local matchers missed)
     stored_profiles = scorer._load_profile_images() if not insight_match else []
 
     # ── Phase 1: run Hive AI + Claude AI-detection in parallel ───────────────────
@@ -468,6 +506,7 @@ async def check_face(
         "match_found":       result.match_found,
         "match_confidence":  round(result.match_confidence, 3) if result.match_confidence else None,
         "match_source":      match_source,
+        "face_match_engine": face_match_engine,
         "profile":           profile_data,
         "crowdsource": {
             "total_checks":    result.crowdsource.total_checks,
