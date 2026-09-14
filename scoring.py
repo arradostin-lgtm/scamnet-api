@@ -93,6 +93,7 @@ class Scorer:
         session_hash: str,
         user_id: Optional[str] = None,
         country_code: Optional[str] = None,
+        insight_match: Optional[dict] = None,   # from InsightFace pre-computed in api.py
     ) -> RiskResult:
         bd = ScoreBreakdown()
         result = RiskResult(risk_level="clean", risk_score=0.0)
@@ -109,23 +110,39 @@ class Scorer:
             result.ai_confidence = ai["confidence"]
             result.detected_ai_model = ai.get("model_hint")
 
-        # ── 2. DB face comparison via Claude Vision ───────────────────────────
-        stored = self._load_profile_images()
+        # ── 2a. InsightFace embedding match (fast, no API cost) ───────────────
         match_type = "no_match"
 
-        if stored:
-            cmp = compare_faces_with_claude(image_bytes, stored)
-            if cmp.get("matched") and cmp.get("profile_id"):
-                conf = float(cmp.get("confidence", 0.0))
-                result.match_found = True
-                result.match_confidence = conf
-                result.profile_id = cmp["profile_id"]
-                if conf >= 0.85:
-                    bd.db_match = float(config.SCORE_DB_MATCH_MAX)
-                    match_type = "match"
-                else:
-                    bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
-                    match_type = "partial"
+        if insight_match:
+            sim = insight_match["similarity"]
+            result.match_found = True
+            result.match_confidence = sim
+            result.profile_id = insight_match["profile_id"]
+            # Map cosine similarity to score points
+            if sim >= 0.55:
+                bd.db_match = float(config.SCORE_DB_MATCH_MAX)
+                match_type = "match"
+            else:
+                bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
+                match_type = "partial"
+            print(f"[scoring] InsightFace match used: {result.profile_id} sim={sim}")
+
+        # ── 2b. Claude Vision comparison as fallback (if InsightFace missed) ──
+        if not result.match_found:
+            stored = self._load_profile_images()
+            if stored:
+                cmp = compare_faces_with_claude(image_bytes, stored)
+                if cmp.get("matched") and cmp.get("profile_id"):
+                    conf = float(cmp.get("confidence", 0.0))
+                    result.match_found = True
+                    result.match_confidence = conf
+                    result.profile_id = cmp["profile_id"]
+                    if conf >= 0.85:
+                        bd.db_match = float(config.SCORE_DB_MATCH_MAX)
+                        match_type = "match"
+                    else:
+                        bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
+                        match_type = "partial"
 
         # ── 3. Crowdsource signal ─────────────────────────────────────────────
         crowd = self._crowd_stats(face_phash)

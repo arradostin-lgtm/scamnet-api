@@ -17,6 +17,10 @@ Pillow==11.1.0
 numpy==2.2.2
 imagehash==4.3.1               # perceptual hashing (phash)
 
+# ── Face recognition (InsightFace) ────────────────────────────────────────────
+insightface>=0.7.3             # ArcFace embeddings, buffalo_sc model (~100 MB)
+onnxruntime>=1.16.0            # CPU inference for InsightFace
+
 # ── Claude Vision API (face comparison + AI detection) ───────────────────────
 anthropic>=0.40.0
 

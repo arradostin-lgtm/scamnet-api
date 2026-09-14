@@ -1,9 +1,76 @@
-"""Face analysis via Claude Vision API + perceptual hashing."""
+"""Face analysis: InsightFace embeddings + Claude Vision + perceptual hashing."""
 import base64
 import hashlib
 import io
 import json
+import os
 from typing import Optional
+
+import numpy as np
+
+
+# ── InsightFace: real face recognition ────────────────────────────────────────
+
+_face_app = None
+
+
+def _get_face_app():
+    """Load InsightFace once and cache in module scope."""
+    global _face_app
+    if _face_app is not None:
+        return _face_app
+    try:
+        import insightface
+        app = insightface.app.FaceAnalysis(
+            name="buffalo_sc",                   # lightweight ~100 MB model
+            providers=["CPUExecutionProvider"],
+        )
+        app.prepare(ctx_id=-1, det_size=(640, 640))
+        _face_app = app
+        print("[face] InsightFace loaded (buffalo_sc, CPU)")
+        return app
+    except Exception as e:
+        print(f"[face] InsightFace unavailable: {e}")
+        return None
+
+
+def compute_face_embedding(image_bytes: bytes) -> Optional[bytes]:
+    """
+    Compute 512-dim ArcFace embedding for the largest face in the image.
+    Returns raw float32 bytes (stored as BLOB) or None if no face detected.
+    """
+    from PIL import Image
+    app = _get_face_app()
+    if app is None:
+        return None
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        arr = np.array(img)
+        faces = app.get(arr)
+        if not faces:
+            return None
+        # Use the largest detected face
+        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        emb = face.embedding.astype(np.float32)
+        return emb.tobytes()
+    except Exception as e:
+        print(f"[face] embedding error: {e}")
+        return None
+
+
+def embedding_similarity(blob_a: bytes, blob_b: bytes) -> float:
+    """Cosine similarity between two stored embeddings (float32 blobs). Range: -1..1."""
+    a = np.frombuffer(blob_a, dtype=np.float32)
+    b = np.frombuffer(blob_b, dtype=np.float32)
+    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# Threshold: InsightFace cosine similarity for "same person"
+# buffalo_sc: >0.40 → likely same person, >0.50 → high confidence
+FACE_MATCH_THRESHOLD = 0.40
 
 
 # ── Perceptual hash ───────────────────────────────────────────────────────────

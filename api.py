@@ -38,6 +38,7 @@ from models import (
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
 from osint import search_person, reverse_image_search, format_for_response as osint_format, _domain_label, REVERSE_SEARCH_LINKS
+from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -217,11 +218,33 @@ async def check_face(
     from datetime import date
     session_hash = hashlib.sha256(f"{ip}{ua}{date.today()}".encode()).hexdigest()
 
+    # ── InsightFace: compute embedding and match against known profiles ──────────
+    face_emb = compute_face_embedding(image_bytes)
+    insight_match = None   # {"profile_id": str, "similarity": float}
+
+    if face_emb is not None:
+        try:
+            with db() as conn:
+                rows = conn.execute(
+                    "SELECT profile_id, embedding FROM face_embeddings WHERE embedding IS NOT NULL"
+                ).fetchall()
+            best_sim, best_pid = 0.0, None
+            for row in rows:
+                sim = embedding_similarity(face_emb, row["embedding"])
+                if sim > best_sim:
+                    best_sim, best_pid = sim, row["profile_id"]
+            if best_sim >= FACE_MATCH_THRESHOLD:
+                insight_match = {"profile_id": best_pid, "similarity": round(best_sim, 3)}
+                print(f"[face] InsightFace match: {best_pid} sim={best_sim:.3f}")
+        except Exception as e:
+            print(f"[face] InsightFace match error: {e}")
+
     result = scorer.score_face(
         image_bytes=image_bytes,
         session_hash=session_hash,
         user_id=user["id"] if user else None,
         country_code=request.headers.get("CF-IPCountry"),
+        insight_match=insight_match,
     )
 
     # Increment user check counter
@@ -640,7 +663,7 @@ async def setup_test_profile(
                  amount, "USD", reason, "verified")
             )
 
-    # Store only hash + phash reference — no raw bytes in DB
+    # Store hash + phash reference — no raw bytes in DB
     img_hash = hashlib.sha256(image_bytes).hexdigest()
     with db() as conn:
         conn.execute("DELETE FROM face_images WHERE profile_id=?", (profile_id,))
@@ -650,11 +673,27 @@ async def setup_test_profile(
             (profile_id, img_hash, face_phash),
         )
 
+    # Compute and store InsightFace embedding for this profile
+    face_emb = compute_face_embedding(image_bytes)
+    embedding_stored = False
+    if face_emb is not None:
+        with db() as conn:
+            conn.execute("DELETE FROM face_embeddings WHERE profile_id=?", (profile_id,))
+            conn.execute(
+                """INSERT INTO face_embeddings
+                   (profile_id, embedding, embedding_dim, model, image_hash)
+                   VALUES (?,?,?,?,?)""",
+                (profile_id, face_emb, 512, "insightface_buffalo_sc", img_hash),
+            )
+        embedding_stored = True
+        print(f"[admin] InsightFace embedding stored for {profile_id}")
+
     return {
         "status": "ok",
         "profile_id": profile_id,
         "face_phash": face_phash,
         "image_stored": False,
+        "embedding_stored": embedding_stored,
         "reports_created": 10,
     }
 
