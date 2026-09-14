@@ -730,6 +730,40 @@ async def reset_user_limits(
     return {"status": "ok", "email": email, "checks_used": checks_used, "checks_limit": checks_limit}
 
 
+@app.post("/admin/debug-vision", tags=["admin"])
+async def debug_vision(
+    file: UploadFile = File(...),
+    admin_key: str = Form("scamnet-test-2026"),
+):
+    """Debug endpoint: run Vision API on uploaded photo and return raw result."""
+    if admin_key != os.getenv("ADMIN_KEY", "scamnet-test-2026"):
+        raise HTTPException(403, "Invalid admin key")
+
+    image_bytes = await file.read()
+    import base64, httpx as _httpx
+
+    vision_key = os.getenv("GOOGLE_VISION_API_KEY", "") or os.getenv("GOOGLE_SEARCH_API_KEY", "")
+    if not vision_key:
+        return {"error": "GOOGLE_VISION_API_KEY not set"}
+
+    b64 = base64.b64encode(image_bytes).decode()
+    async with _httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            "https://vision.googleapis.com/v1/images:annotate",
+            params={"key": vision_key},
+            json={"requests": [{
+                "image": {"content": b64},
+                "features": [{"type": "WEB_DETECTION", "maxResults": 10}],
+            }]},
+        )
+
+    return {
+        "status_code": r.status_code,
+        "key_used": vision_key[:8] + "...",
+        "response": r.json(),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host=config.API_HOST, port=config.API_PORT, reload=True)
