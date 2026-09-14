@@ -33,14 +33,15 @@ SCAM_SITES = [
 
 # ── Social media platforms ─────────────────────────────────────────────────────
 SOCIAL_PLATFORMS = [
-    {"name": "VK",         "domain": "vk.com",       "pattern": r'vk\.com/([\w\.]+)(?:\?|/|$)'},
-    {"name": "Instagram",  "domain": "instagram.com", "pattern": r'instagram\.com/([\w\.]+)(?:\?|/|$)'},
-    {"name": "Telegram",   "domain": "t.me",          "pattern": r't\.me/([\w]+)'},
-    {"name": "Facebook",   "domain": "facebook.com",  "pattern": r'facebook\.com/(?:people/[\w\.\-]+|[\w\.]+)'},
-    {"name": "Twitter",    "domain": "x.com",         "pattern": r'(?:x|twitter)\.com/([\w]+)'},
-    {"name": "Одноклассники", "domain": "ok.ru",      "pattern": r'ok\.ru/profile/\d+'},
-    {"name": "TikTok",     "domain": "tiktok.com",    "pattern": r'tiktok\.com/@([\w\.]+)'},
-    {"name": "YouTube",    "domain": "youtube.com",   "pattern": r'youtube\.com/(?:@|channel/|user/)([\w\.\-]+)'},
+    {"name": "VK",            "domain": "vk.com",        "pattern": r'vk\.com/([\w\.]+)(?:\?|/|$)'},
+    {"name": "Instagram",     "domain": "instagram.com",  "pattern": r'instagram\.com/([\w\.]+)(?:\?|/|$)'},
+    {"name": "Telegram",      "domain": "t.me",           "pattern": r't\.me/([\w]+)'},
+    {"name": "Facebook",      "domain": "facebook.com",   "pattern": r'facebook\.com/(?:people/[\w\.\-]+|[\w\.]+)'},
+    {"name": "Twitter",       "domain": "x.com",          "pattern": r'(?:x|twitter)\.com/([\w]+)'},
+    {"name": "Одноклассники", "domain": "ok.ru",          "pattern": r'ok\.ru/profile/\d+'},
+    {"name": "TikTok",        "domain": "tiktok.com",     "pattern": r'tiktok\.com/@([\w\.]+)'},
+    {"name": "YouTube",       "domain": "youtube.com",    "pattern": r'youtube\.com/(?:@|channel/|user/)([\w\.\-]+)'},
+    {"name": "LinkedIn",      "domain": "linkedin.com",   "pattern": r'linkedin\.com/in/([\w\-]+)'},
 ]
 
 
@@ -263,9 +264,138 @@ def _build_manual_search_urls(name: str) -> dict:
     return {
         "google":    f"https://www.google.com/search?q=%22{qe}%22+мошенник",
         "vk":        f"https://vk.com/search?c%5Bsection%5D=people&q={q}",
+        "linkedin":  f"https://www.linkedin.com/search/results/people/?keywords={qe}",
         "instagram": f"https://www.instagram.com/explore/tags/{q}/",
         "banki":     f"https://www.banki.ru/services/search/?search={qe}",
     }
+
+
+# ── Reverse image search ───────────────────────────────────────────────────────
+
+REVERSE_SEARCH_LINKS = {
+    "Yandex Картинки": "https://yandex.ru/images/",
+    "Google Lens":     "https://lens.google.com/",
+    "TinEye":          "https://tineye.com/",
+    "PimEyes":         "https://pimeyes.com/en",
+}
+
+
+async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+    """
+    Reverse image search: POST photo to Yandex Images, extract social links
+    and sites where the face was found.
+
+    Returns:
+        {
+            "social":    {"VK": "url", ...},
+            "found_on":  [{"url": "...", "title": "...", "severity": "medium"}],
+            "entities":  ["Name extracted from Yandex"],
+        }
+    """
+    try:
+        return await _yandex_reverse_search(image_bytes, timeout)
+    except asyncio.TimeoutError:
+        return {"social": {}, "found_on": [], "entities": []}
+    except Exception as e:
+        print(f"[osint] yandex reverse search: {e}")
+        return {"social": {}, "found_on": [], "entities": []}
+
+
+async def _yandex_reverse_search(image_bytes: bytes, timeout: float = 20.0) -> dict:
+    import io
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": "https://yandex.ru/images/",
+    }
+
+    async with httpx.AsyncClient(
+        headers=headers, follow_redirects=True, timeout=timeout
+    ) as client:
+        files = {"upfile": ("photo.jpg", io.BytesIO(image_bytes), "image/jpeg")}
+        r = await client.post(
+            "https://yandex.ru/images/search",
+            data={"rpt": "imageview", "cbir_page": "sites"},
+            files=files,
+        )
+
+    if r.status_code not in (200, 301, 302):
+        return {"social": {}, "found_on": [], "entities": []}
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    social: dict = {}
+    found_on: list = []
+    entities: list = []
+
+    def _norm_href(href: str) -> str:
+        if href.startswith("//"):
+            return "https:" + href
+        return href if href.startswith("http") else ""
+
+    # 1. Yandex "Sites where image appears" blocks
+    for sel in [".CbirSites__item", ".cbir-section__sites-item", "[class*='CbirSites']"]:
+        for item in soup.select(sel):
+            a = item.select_one("a[href]")
+            if not a:
+                continue
+            href = _norm_href(a.get("href", ""))
+            if not href:
+                continue
+            title = item.get_text(" ", strip=True)[:200]
+            _collect(href, title, social, found_on)
+        if found_on:
+            break
+
+    # 2. Fallback: scan all links
+    if not found_on:
+        seen = set()
+        for a in soup.select("a[href]"):
+            href = _norm_href(a.get("href", ""))
+            if not href or href in seen:
+                continue
+            if any(skip in href for skip in ["yandex", "google", "javascript", "mailto"]):
+                continue
+            seen.add(href)
+            title = a.get_text(" ", strip=True)[:200]
+            _collect(href, title, social, found_on)
+            if len(found_on) >= 10:
+                break
+
+    # 3. Named entity / celebrity block
+    for sel in [".CbirCelebrity__title", "[class*='celebrity']", "[class*='Celebrity']"]:
+        for el in soup.select(sel):
+            t = el.get_text(strip=True)
+            if t and len(t) > 2:
+                entities.append(t)
+
+    return {"social": social, "found_on": found_on[:10], "entities": entities[:3]}
+
+
+def _collect(href: str, title: str, social: dict, found_on: list) -> None:
+    """Classify one URL: put into social dict if it's a profile, else found_on list."""
+    for plat in SOCIAL_PLATFORMS:
+        if plat["domain"] in href:
+            m = re.search(plat["pattern"], href, re.I)
+            if m and not any(s in href for s in ["/search", "/hashtag", "/explore", "/reel", "/p/"]):
+                if plat["name"] not in social:
+                    social[plat["name"]] = href
+            return
+    if title:
+        found_on.append({"url": href, "title": title, "severity": "medium"})
+
+
+def _domain_label(url: str) -> str:
+    m = re.search(r'https?://(?:www\.)?([\w\-]+\.[\w\-]+)', url)
+    return m.group(1) if m else url[:40]
 
 
 def format_for_response(osint: dict) -> dict:

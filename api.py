@@ -36,7 +36,7 @@ from models import (
 )
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
-from osint import search_person, format_for_response as osint_format
+from osint import search_person, reverse_image_search, format_for_response as osint_format, _domain_label, REVERSE_SEARCH_LINKS
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -190,29 +190,54 @@ async def check_face(
                 d = row_to_dict(row)
                 profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
 
-    # ── OSINT: search internet for scam mentions and social profiles ──────────
-    osint_data = {"osint_social": {}, "osint_mentions": [], "osint_search_urls": {}}
+    # ── OSINT: text search by name (if known) + reverse image search (always) ──
+    osint_data = {
+        "osint_social": {},
+        "osint_mentions": [],
+        "osint_search_urls": {},
+        "osint_entities": [],
+        "osint_reverse_links": REVERSE_SEARCH_LINKS,
+    }
     try:
         p = profile_data or {}
         search_name = (
-            p.get("known_as") or p.get("real_name") or
-            p.get("known_name") or ""
+            p.get("known_as") or p.get("real_name") or p.get("known_name") or ""
         )
+
+        # 1. Text-based search when name is known
         if search_name and len(search_name) > 3:
             aliases_raw = p.get("known_aliases", "[]") or "[]"
             try:
                 aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
             except Exception:
                 aliases = []
-            nationality = p.get("nationality")
-
             raw = await search_person(
                 name=search_name,
                 aliases=aliases,
-                nationality=nationality,
+                nationality=p.get("nationality"),
                 timeout=18.0,
             )
-            osint_data = osint_format(raw)
+            osint_data.update(osint_format(raw))
+
+        # 2. Reverse image search — always, regardless of DB match
+        try:
+            rev = await reverse_image_search(image_bytes, timeout=15.0)
+            # Merge social links (don't overwrite text-search results)
+            for k, v in rev.get("social", {}).items():
+                osint_data["osint_social"].setdefault(k, v)
+            # Add sites-where-found as OSINT mentions
+            for site in rev.get("found_on", []):
+                osint_data["osint_mentions"].append({
+                    "source": _domain_label(site["url"]),
+                    "text":   site.get("title", "Упоминание по обратному поиску"),
+                    "url":    site["url"],
+                    "severity": "medium",
+                })
+            # Named entities Yandex might have recognised
+            osint_data["osint_entities"].extend(rev.get("entities", []))
+        except Exception as e:
+            print(f"[osint] reverse image search error: {e}")
+
     except Exception as e:
         print(f"[osint] error: {e}")
 
@@ -240,10 +265,12 @@ async def check_face(
             "ai_flag":     result.breakdown.ai_flag,
             "total":       result.breakdown.total,
         },
-        # OSINT results from internet search
-        "osint_social":      osint_data["osint_social"],
-        "osint_mentions":    osint_data["osint_mentions"],
-        "osint_search_urls": osint_data["osint_search_urls"],
+        # OSINT results from internet search + reverse image search
+        "osint_social":         osint_data["osint_social"],
+        "osint_mentions":       osint_data["osint_mentions"],
+        "osint_search_urls":    osint_data["osint_search_urls"],
+        "osint_entities":       osint_data.get("osint_entities", []),
+        "osint_reverse_links":  osint_data.get("osint_reverse_links", REVERSE_SEARCH_LINKS),
     }
 
 
