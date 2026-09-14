@@ -354,7 +354,7 @@ def analyze_exif(image_bytes: bytes) -> dict:
         exif = getattr(img, "_getexif", lambda: None)()
 
         if exif is None:
-            result["risk_signals"].append("Нет EXIF — возможно AI или скриншот")
+            result["risk_signals"].append("no_exif")
             return result
 
         result["has_exif"] = True
@@ -376,16 +376,16 @@ def analyze_exif(image_bytes: bytes) -> dict:
         if software:
             sw_low = str(software).lower()
             if any(hint in sw_low for hint in _AI_SW):
-                result["risk_signals"].append(f"ПО: {software} — AI-генератор")
+                result["risk_signals"].append(f"ai_software:{software}")
 
         if not make and not model:
-            result["risk_signals"].append("Нет данных о камере в EXIF")
+            result["risk_signals"].append("no_camera")
 
         if not date:
-            result["risk_signals"].append("Нет даты съёмки в EXIF")
+            result["risk_signals"].append("no_date")
 
     except Exception:
-        result["risk_signals"].append("Не удалось прочитать EXIF")
+        result["risk_signals"].append("exif_read_error")
 
     return result
 

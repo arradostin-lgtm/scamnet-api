@@ -1131,11 +1131,11 @@ async def _numverify_lookup(phone: Optional[str], timeout: float = 8.0) -> Optio
         line_type = data.get("line_type", "")
         risk_signals = []
         if line_type == "voip":
-            risk_signals.append("VoIP номер — часто используется мошенниками")
+            risk_signals.append("phone_voip")
         elif line_type == "toll_free":
-            risk_signals.append("Бесплатный номер (800/888)")
+            risk_signals.append("phone_tollfree")
         elif line_type == "premium_rate":
-            risk_signals.append("Премиум-тариф")
+            risk_signals.append("phone_premium")
 
         result = {
             "valid": True,
