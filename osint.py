@@ -102,7 +102,7 @@ def _build_context(
     platform_met: Optional[str] = None,
     company: Optional[str] = None,
     username: Optional[str] = None,
-) -> list[str]:
+) -> list:
     """
     Build a list of context terms to append to search queries.
     Each term is added verbatim — keeps queries short but precise.
@@ -129,8 +129,8 @@ def _name_term(name: str) -> str:
 
 
 async def _find_social_profiles(
-    names: list[str],
-    ctx: list[str],
+    names: list,
+    ctx: list,
     username: Optional[str],
     timeout: float = 15.0,
     prefer_country: Optional[str] = None,
@@ -259,8 +259,8 @@ def _pick_by_country(urls: list, country: str) -> Optional[str]:
 
 
 async def _find_scam_mentions(
-    names: list[str],
-    ctx: list[str],
+    names: list,
+    ctx: list,
     timeout: float = 20.0,
 ) -> list:
     """
