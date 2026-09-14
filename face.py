@@ -111,7 +111,7 @@ def _media_type(image_bytes: bytes) -> str:
 
 # ── Claude Vision: face comparison ────────────────────────────────────────────
 
-def compare_faces_with_claude(
+async def compare_faces_with_claude(
     query_bytes: bytes,
     stored_profiles: list,  # [{"profile_id": str, "seed_photo_path": str, "name": str}]
     seed_photos_dir: Optional[str] = None,
@@ -194,8 +194,8 @@ def compare_faces_with_claude(
     })
 
     try:
-        from anthropic import Anthropic
-        msg = Anthropic().messages.create(
+        from anthropic import AsyncAnthropic
+        msg = await AsyncAnthropic().messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{"role": "user", "content": content}],
@@ -277,7 +277,7 @@ async def detect_ai_hive(image_bytes: bytes) -> Optional[dict]:
 
 # ── Claude Vision: AI-generated image detection ───────────────────────────────
 
-def detect_ai_image(image_bytes: bytes) -> dict:
+async def detect_ai_image(image_bytes: bytes) -> dict:
     """
     Detect if a face photo is AI-generated using Claude Vision + local heuristics.
     Returns: {is_ai, confidence, model_hint}
@@ -285,8 +285,8 @@ def detect_ai_image(image_bytes: bytes) -> dict:
     local_score = _local_ai_heuristic(image_bytes)
 
     try:
-        from anthropic import Anthropic
-        msg = Anthropic().messages.create(
+        from anthropic import AsyncAnthropic
+        msg = await AsyncAnthropic().messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=150,
             messages=[{

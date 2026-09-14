@@ -38,7 +38,7 @@ from models import (
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
 from osint import search_person, reverse_image_search, format_for_response as osint_format, _domain_label, REVERSE_SEARCH_LINKS
-from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD, analyze_exif, detect_ai_hive
+from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD, analyze_exif, detect_ai_hive, detect_ai_image, compare_faces_with_claude
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -241,9 +241,47 @@ async def check_face(
         except Exception as e:
             print(f"[face] InsightFace match error: {e}")
 
-    # Run Hive AI detector in parallel with scorer (non-blocking)
     import asyncio as _asyncio
-    hive_task = _asyncio.create_task(detect_ai_hive(image_bytes))
+    from face import image_sha256 as _img_hash
+
+    img_hash = _img_hash(image_bytes)
+
+    # Check AI cache before launching async tasks
+    cached_ai = scorer.get_cached_ai(img_hash)
+
+    # Load profiles for Claude face comparison (only if InsightFace missed)
+    stored_profiles = scorer._load_profile_images() if not insight_match else []
+
+    # Run all Claude/Hive tasks in parallel — zero sequential blocking
+    hive_task        = _asyncio.create_task(detect_ai_hive(image_bytes))
+    claude_ai_task   = _asyncio.create_task(detect_ai_image(image_bytes)) if not cached_ai else None
+    claude_face_task = _asyncio.create_task(
+        compare_faces_with_claude(image_bytes, stored_profiles)
+    ) if stored_profiles else None
+
+    hive_result, claude_ai_result, claude_face_result = None, cached_ai, None
+    try:
+        tasks = [hive_task]
+        if claude_ai_task:   tasks.append(claude_ai_task)
+        if claude_face_task: tasks.append(claude_face_task)
+        results = await _asyncio.gather(*tasks, return_exceptions=True)
+
+        idx = 0
+        hive_result = results[idx] if not isinstance(results[idx], Exception) else None; idx += 1
+        if claude_ai_task:
+            claude_ai_result = results[idx] if not isinstance(results[idx], Exception) else cached_ai; idx += 1
+        if claude_face_task:
+            claude_face_result = results[idx] if not isinstance(results[idx], Exception) else None
+
+        if hive_result:
+            print(f"[hive] is_ai={hive_result['is_ai']} conf={hive_result['confidence']}")
+        if claude_ai_result and not cached_ai:
+            scorer.cache_ai_result(img_hash, claude_ai_result, "claude_vision")
+    except Exception as e:
+        print(f"[parallel] Claude/Hive gather error: {e}")
+
+    # Hive overrides Claude when available (more accurate specialist)
+    ai_result = hive_result or claude_ai_result or {"is_ai": False, "confidence": 0.0, "model_hint": "unknown"}
 
     result = scorer.score_face(
         image_bytes=image_bytes,
@@ -251,15 +289,9 @@ async def check_face(
         user_id=user["id"] if user else None,
         country_code=request.headers.get("CF-IPCountry"),
         insight_match=insight_match,
+        ai_result=ai_result,
+        claude_match=claude_face_result,
     )
-
-    hive_result = None
-    try:
-        hive_result = await _asyncio.wait_for(hive_task, timeout=15.0)
-        if hive_result:
-            print(f"[hive] is_ai={hive_result['is_ai']} conf={hive_result['confidence']}")
-    except Exception as e:
-        print(f"[hive] await error: {e}")
 
     # Increment user check counter
     if user:
@@ -404,10 +436,9 @@ async def check_face(
     return {
         "risk_level":        result.risk_level,
         "risk_score":        round(result.risk_score, 1),
-        # Hive AI overrides scorer when available (more accurate specialist model)
-        "is_ai_generated":   hive_result["is_ai"]         if hive_result else result.is_ai_generated,
-        "ai_confidence":     hive_result["confidence"]    if hive_result else result.ai_confidence,
-        "detected_ai_model": hive_result["model_hint"]    if hive_result else result.detected_ai_model,
+        "is_ai_generated":   result.is_ai_generated,
+        "ai_confidence":     result.ai_confidence,
+        "detected_ai_model": result.detected_ai_model,
         "hive_ai":           hive_result,
         "match_found":       result.match_found,
         "match_confidence":  round(result.match_confidence, 3) if result.match_confidence else None,

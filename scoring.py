@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import config
-from face import compute_phash, image_sha256, compare_faces_with_claude, detect_ai_image
+from face import compute_phash, image_sha256
 from database import db, row_to_dict
 
 
@@ -94,6 +94,8 @@ class Scorer:
         user_id: Optional[str] = None,
         country_code: Optional[str] = None,
         insight_match: Optional[dict] = None,   # from InsightFace pre-computed in api.py
+        ai_result: Optional[dict] = None,        # from detect_ai_image / hive — pre-computed async
+        claude_match: Optional[dict] = None,     # from compare_faces_with_claude — pre-computed async
     ) -> RiskResult:
         bd = ScoreBreakdown()
         result = RiskResult(risk_level="clean", risk_score=0.0)
@@ -102,8 +104,8 @@ class Scorer:
         face_phash = compute_phash(image_bytes)
         result.face_phash = face_phash
 
-        # ── 1. AI image detection (cached) ────────────────────────────────────
-        ai = self._cached_ai_check(img_hash, image_bytes)
+        # ── 1. AI image detection (result pre-computed async in api.py) ───────
+        ai = ai_result or {"is_ai": False, "confidence": 0.0, "model_hint": "unknown"}
         if ai["is_ai"]:
             bd.ai_flag = float(config.SCORE_AI_FLAG)
             result.is_ai_generated = True
@@ -118,7 +120,6 @@ class Scorer:
             result.match_found = True
             result.match_confidence = sim
             result.profile_id = insight_match["profile_id"]
-            # Map cosine similarity to score points
             if sim >= 0.55:
                 bd.db_match = float(config.SCORE_DB_MATCH_MAX)
                 match_type = "match"
@@ -127,22 +128,18 @@ class Scorer:
                 match_type = "partial"
             print(f"[scoring] InsightFace match used: {result.profile_id} sim={sim}")
 
-        # ── 2b. Claude Vision comparison as fallback (if InsightFace missed) ──
-        if not result.match_found:
-            stored = self._load_profile_images()
-            if stored:
-                cmp = compare_faces_with_claude(image_bytes, stored)
-                if cmp.get("matched") and cmp.get("profile_id"):
-                    conf = float(cmp.get("confidence", 0.0))
-                    result.match_found = True
-                    result.match_confidence = conf
-                    result.profile_id = cmp["profile_id"]
-                    if conf >= 0.85:
-                        bd.db_match = float(config.SCORE_DB_MATCH_MAX)
-                        match_type = "match"
-                    else:
-                        bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
-                        match_type = "partial"
+        # ── 2b. Claude Vision match (pre-computed async in api.py) ───────────
+        if not result.match_found and claude_match and claude_match.get("matched"):
+            conf = float(claude_match.get("confidence", 0.0))
+            result.match_found = True
+            result.match_confidence = conf
+            result.profile_id = claude_match["profile_id"]
+            if conf >= 0.85:
+                bd.db_match = float(config.SCORE_DB_MATCH_MAX)
+                match_type = "match"
+            else:
+                bd.db_match = float(config.SCORE_DB_MATCH_MAX) * 0.6
+                match_type = "partial"
 
         # ── 3. Crowdsource signal ─────────────────────────────────────────────
         crowd = self._crowd_stats(face_phash)
@@ -218,8 +215,22 @@ class Scorer:
                 })
         return result
 
-    def _cached_ai_check(self, img_hash: str, image_bytes: bytes) -> dict:
-        """Check AI-detection cache, run detect_ai_image only on cache miss."""
+    def cache_ai_result(self, img_hash: str, ai: dict, method: str = "claude_vision") -> None:
+        """Store AI detection result in cache (called from api.py after async detection)."""
+        try:
+            with db() as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO ai_detection_cache
+                       (image_hash, is_ai_generated, confidence, detected_model, detection_method)
+                       VALUES (?,?,?,?,?)""",
+                    (img_hash, int(ai["is_ai"]), ai["confidence"],
+                     ai.get("model_hint", "unknown"), method),
+                )
+        except Exception as e:
+            print(f"[scoring] cache_ai_result error: {e}")
+
+    def get_cached_ai(self, img_hash: str) -> Optional[dict]:
+        """Return cached AI detection result or None."""
         with db() as conn:
             row = conn.execute(
                 "SELECT * FROM ai_detection_cache WHERE image_hash=?", (img_hash,)
@@ -230,17 +241,7 @@ class Scorer:
                 "confidence": row["confidence"],
                 "model_hint": row["detected_model"],
             }
-
-        ai = detect_ai_image(image_bytes)
-        with db() as conn:
-            conn.execute(
-                """INSERT OR IGNORE INTO ai_detection_cache
-                   (image_hash, is_ai_generated, confidence, detected_model, detection_method)
-                   VALUES (?,?,?,?,?)""",
-                (img_hash, int(ai["is_ai"]), ai["confidence"],
-                 ai.get("model_hint", "unknown"), "claude_vision"),
-            )
-        return ai
+        return None
 
     def _crowd_stats(self, face_phash: str) -> CrowdsourceSignal:
         with db() as conn:
