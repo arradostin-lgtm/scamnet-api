@@ -808,6 +808,21 @@ async def reset_user_limits(
     return {"status": "ok", "email": email, "checks_used": checks_used, "checks_limit": checks_limit}
 
 
+@app.post("/admin/debug-hive", tags=["admin"])
+async def debug_hive(
+    file: UploadFile = File(...),
+    admin_key: str = Form("scamnet-test-2026"),
+):
+    """Debug endpoint: run Hive AI detection on uploaded photo."""
+    if admin_key != os.getenv("ADMIN_KEY", "scamnet-test-2026"):
+        raise HTTPException(403, "Invalid admin key")
+    image_bytes = await file.read()
+    result = await detect_ai_hive(image_bytes)
+    if result is None:
+        return {"error": "HIVE_AI_API_KEY not set or Hive unavailable"}
+    return result
+
+
 @app.post("/admin/debug-vision", tags=["admin"])
 async def debug_vision(
     file: UploadFile = File(...),
