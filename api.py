@@ -413,6 +413,7 @@ async def check_face(
             osint_data["ipqs_email"]     = raw.get("ipqs_email")
             osint_data["ipqs_phone"]     = raw.get("ipqs_phone")
             osint_data["hunter_email"]   = raw.get("hunter_email")
+            osint_data["emailrep"]       = raw.get("emailrep")
 
         # 2. Reverse image search — always, regardless of DB match
         try:
@@ -474,6 +475,7 @@ async def check_face(
         "ipqs_email":           osint_data.get("ipqs_email"),
         "ipqs_phone":           osint_data.get("ipqs_phone"),
         "hunter_email":         osint_data.get("hunter_email"),
+        "emailrep":             osint_data.get("emailrep"),
         "exif":                 exif_info,
         "user_context": {k: v for k, v in {
             "known_name": known_name,

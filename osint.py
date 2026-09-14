@@ -28,6 +28,7 @@ NUMVERIFY_API_KEY = os.getenv("NUMVERIFY_API_KEY", "")          # numverify.com,
 LEAKCHECK_API_KEY = os.getenv("LEAKCHECK_API_KEY", "")          # leakcheck.io, 100 free/month
 IPQS_API_KEY = os.getenv("IPQS_API_KEY", "")                    # ipqualityscore.com, 200 free/month
 HUNTER_API_KEY = os.getenv("HUNTER_API_KEY", "")               # hunter.io, 25 free/month
+EMAILREP_API_KEY = os.getenv("EMAILREP_API_KEY", "")           # emailrep.io, 1000 free/day with key, 100/day without
 
 # ── Scam forum / review sites to specifically search ──────────────────────────
 SCAM_SITES = [
@@ -133,16 +134,19 @@ async def search_person(
     hunter_task = asyncio.create_task(
         _hunter_email(email, timeout=8.0) if email else _empty_none()
     )
+    emailrep_task = asyncio.create_task(
+        _emailrep(email, timeout=8.0) if email else _empty_none()
+    )
 
     try:
         (
             social, mentions, sanctions,
             email_breaches, telegram, phone_info,
-            leakcheck, ipqs_email, ipqs_phone, hunter_email,
+            leakcheck, ipqs_email, ipqs_phone, hunter_email, emailrep,
         ) = await asyncio.gather(
             social_task, mentions_task, sanctions_task,
             hibp_task, telegram_task, phone_task,
-            leakcheck_task, ipqs_email_task, ipqs_phone_task, hunter_task,
+            leakcheck_task, ipqs_email_task, ipqs_phone_task, hunter_task, emailrep_task,
             return_exceptions=True,
         )
         if isinstance(social, Exception):        social = {}
@@ -155,10 +159,11 @@ async def search_person(
         if isinstance(ipqs_email, Exception):    ipqs_email = None
         if isinstance(ipqs_phone, Exception):    ipqs_phone = None
         if isinstance(hunter_email, Exception):  hunter_email = None
+        if isinstance(emailrep, Exception):      emailrep = None
     except Exception:
         social, mentions, sanctions = {}, [], []
         email_breaches, telegram, phone_info = [], None, None
-        leakcheck, ipqs_email, ipqs_phone, hunter_email = [], None, None, None
+        leakcheck, ipqs_email, ipqs_phone, hunter_email, emailrep = [], None, None, None, None
 
     # If Telegram confirmed the account exists — add to social dict
     if telegram and telegram.get("exists") and telegram.get("url"):
@@ -177,6 +182,7 @@ async def search_person(
         "ipqs_email":    ipqs_email,
         "ipqs_phone":    ipqs_phone,
         "hunter_email":  hunter_email,
+        "emailrep":      emailrep,
     }
 
 
@@ -1339,6 +1345,53 @@ async def _hunter_email(email: Optional[str], timeout: float = 8.0) -> Optional[
         return result
     except Exception as e:
         print(f"[osint] Hunter error: {e}")
+        return None
+
+
+async def _emailrep(email: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    Emailrep.io — email reputation and fraud signals.
+    Free: 100 req/day without key, 1000/day with free key (emailrep.io).
+    Returns reputation, suspicious flag, blacklisted, disposable, malicious_activity.
+    """
+    if not email:
+        return None
+    try:
+        headers = {"User-Agent": "Scamnet-OSINT/1.0"}
+        if EMAILREP_API_KEY:
+            headers["Key"] = EMAILREP_API_KEY
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"https://emailrep.io/{email}",
+                headers=headers,
+            )
+        if r.status_code == 400:
+            print(f"[osint] Emailrep: invalid email {email[:4]}***")
+            return None
+        if r.status_code == 429:
+            print("[osint] Emailrep: rate limited (100/day without key)")
+            return None
+        if r.status_code != 200:
+            print(f"[osint] Emailrep HTTP {r.status_code}")
+            return None
+        d = r.json()
+        details = d.get("details", {})
+        result = {
+            "reputation":              d.get("reputation"),           # high/medium/low/none
+            "suspicious":              d.get("suspicious", False),
+            "references":              d.get("references", 0),        # how many sources know this email
+            "blacklisted":             details.get("blacklisted", False),
+            "malicious_activity":      details.get("malicious_activity", False),
+            "malicious_activity_recent": details.get("malicious_activity_recent", False),
+            "disposable":              details.get("disposable", False),
+            "free_provider":           details.get("free_provider", False),
+            "days_since_domain_creation": details.get("days_since_domain_creation"),
+            "spam":                    details.get("spam", False),
+        }
+        print(f"[osint] Emailrep: reputation={result['reputation']} suspicious={result['suspicious']} blacklisted={result['blacklisted']}")
+        return result
+    except Exception as e:
+        print(f"[osint] Emailrep error: {e}")
         return None
 
 
