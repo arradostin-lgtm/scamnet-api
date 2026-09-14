@@ -25,6 +25,9 @@ OPENSANCTIONS_API_KEY = os.getenv("OPENSANCTIONS_API_KEY", "")  # optional, free
 HIBP_API_KEY = os.getenv("HIBP_API_KEY", "")                    # haveibeenpwned.com, $3.50/month
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")        # @BotFather → /newbot → token
 NUMVERIFY_API_KEY = os.getenv("NUMVERIFY_API_KEY", "")          # numverify.com, free 250 req/month
+LEAKCHECK_API_KEY = os.getenv("LEAKCHECK_API_KEY", "")          # leakcheck.io, 100 free/month
+IPQS_API_KEY = os.getenv("IPQS_API_KEY", "")                    # ipqualityscore.com, 200 free/month
+HUNTER_API_KEY = os.getenv("HUNTER_API_KEY", "")               # hunter.io, 25 free/month
 
 # ── Scam forum / review sites to specifically search ──────────────────────────
 SCAM_SITES = [
@@ -118,34 +121,62 @@ async def search_person(
     phone_task = asyncio.create_task(
         _numverify_lookup(phone, timeout=8.0) if phone else _empty_none()
     )
+    leakcheck_task = asyncio.create_task(
+        _leakcheck(email, timeout=8.0) if email else _empty_list()
+    )
+    ipqs_email_task = asyncio.create_task(
+        _ipqs_email(email, timeout=8.0) if email else _empty_none()
+    )
+    ipqs_phone_task = asyncio.create_task(
+        _ipqs_phone(phone, timeout=8.0) if phone else _empty_none()
+    )
+    hunter_task = asyncio.create_task(
+        _hunter_email(email, timeout=8.0) if email else _empty_none()
+    )
 
     try:
-        social, mentions, sanctions, email_breaches, telegram, phone_info = await asyncio.gather(
-            social_task, mentions_task, sanctions_task, hibp_task, telegram_task, phone_task,
+        (
+            social, mentions, sanctions,
+            email_breaches, telegram, phone_info,
+            leakcheck, ipqs_email, ipqs_phone, hunter_email,
+        ) = await asyncio.gather(
+            social_task, mentions_task, sanctions_task,
+            hibp_task, telegram_task, phone_task,
+            leakcheck_task, ipqs_email_task, ipqs_phone_task, hunter_task,
             return_exceptions=True,
         )
-        if isinstance(social, Exception):           social = {}
-        if isinstance(mentions, Exception):         mentions = []
-        if isinstance(sanctions, Exception):        sanctions = []
-        if isinstance(email_breaches, Exception):   email_breaches = []
-        if isinstance(telegram, Exception):         telegram = None
-        if isinstance(phone_info, Exception):       phone_info = None
+        if isinstance(social, Exception):        social = {}
+        if isinstance(mentions, Exception):      mentions = []
+        if isinstance(sanctions, Exception):     sanctions = []
+        if isinstance(email_breaches, Exception): email_breaches = []
+        if isinstance(telegram, Exception):      telegram = None
+        if isinstance(phone_info, Exception):    phone_info = None
+        if isinstance(leakcheck, Exception):     leakcheck = []
+        if isinstance(ipqs_email, Exception):    ipqs_email = None
+        if isinstance(ipqs_phone, Exception):    ipqs_phone = None
+        if isinstance(hunter_email, Exception):  hunter_email = None
     except Exception:
-        social, mentions, sanctions, email_breaches, telegram, phone_info = {}, [], [], [], None, None
+        social, mentions, sanctions = {}, [], []
+        email_breaches, telegram, phone_info = [], None, None
+        leakcheck, ipqs_email, ipqs_phone, hunter_email = [], None, None, None
 
     # If Telegram confirmed the account exists — add to social dict
     if telegram and telegram.get("exists") and telegram.get("url"):
         social.setdefault("Telegram", telegram["url"])
 
     return {
-        "social": social,
-        "mentions": mentions,
-        "search_urls": _build_manual_search_urls(names[0], ctx),
-        "query_names": names,
-        "sanctions": sanctions,
+        "social":        social,
+        "mentions":      mentions,
+        "search_urls":   _build_manual_search_urls(names[0], ctx),
+        "query_names":   names,
+        "sanctions":     sanctions,
         "email_breaches": email_breaches,
-        "telegram": telegram,
-        "phone_info": phone_info,
+        "telegram":      telegram,
+        "phone_info":    phone_info,
+        "leakcheck":     leakcheck,
+        "ipqs_email":    ipqs_email,
+        "ipqs_phone":    ipqs_phone,
+        "hunter_email":  hunter_email,
     }
 
 
@@ -1154,6 +1185,161 @@ async def _hibp_check(email: Optional[str], timeout: float = 8.0) -> list:
     except Exception as e:
         print(f"[osint] HIBP error: {e}")
         return []
+
+
+async def _leakcheck(email: Optional[str], timeout: float = 8.0) -> list:
+    """
+    Leakcheck.io — check email in leaked databases.
+    Free: 100 req/month with key. Public endpoint (no key) rate-limited.
+    Returns list of {source, date, fields} dicts.
+    """
+    if not email:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            if LEAKCHECK_API_KEY:
+                r = await client.get(
+                    f"https://leakcheck.io/api/v2/query/{email}",
+                    headers={"X-API-Key": LEAKCHECK_API_KEY},
+                )
+            else:
+                r = await client.get(
+                    "https://leakcheck.io/api/public",
+                    params={"check": email},
+                )
+        if r.status_code == 404:
+            return []
+        if r.status_code not in (200, 201):
+            print(f"[osint] Leakcheck HTTP {r.status_code}")
+            return []
+        data = r.json()
+        sources = data.get("sources") or data.get("result") or []
+        results = []
+        for s in sources:
+            if isinstance(s, dict):
+                results.append({
+                    "source": s.get("name") or s.get("source", "?"),
+                    "date": s.get("date") or s.get("last_breach"),
+                    "fields": s.get("fields", []),
+                })
+            elif isinstance(s, str):
+                results.append({"source": s, "date": None, "fields": []})
+        if results:
+            print(f"[osint] Leakcheck: {len(results)} sources for {email[:4]}***")
+        return results
+    except Exception as e:
+        print(f"[osint] Leakcheck error: {e}")
+        return []
+
+
+async def _ipqs_email(email: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    IPQualityScore email fraud check.
+    Returns fraud_score (0–100), disposable, valid, leaked, smtp_score.
+    Free: 200 req/month at ipqualityscore.com.
+    """
+    if not email or not IPQS_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"https://ipqualityscore.com/api/json/email/{IPQS_API_KEY}/{email}",
+                params={"fast": "true", "timeout": "5"},
+            )
+        if r.status_code != 200:
+            print(f"[osint] IPQS email HTTP {r.status_code}")
+            return None
+        d = r.json()
+        if not d.get("success"):
+            print(f"[osint] IPQS email: {d.get('message')}")
+            return None
+        result = {
+            "fraud_score":  d.get("fraud_score"),
+            "valid":        d.get("valid"),
+            "disposable":   d.get("disposable"),
+            "leaked":       d.get("leaked"),
+            "smtp_score":   d.get("smtp_score"),
+            "overall_score": d.get("overall_score"),
+            "domain_age_days": (d.get("domain_age") or {}).get("days"),
+        }
+        print(f"[osint] IPQS email fraud_score={result['fraud_score']} disposable={result['disposable']}")
+        return result
+    except Exception as e:
+        print(f"[osint] IPQS email error: {e}")
+        return None
+
+
+async def _ipqs_phone(phone: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    IPQualityScore phone fraud check — runs alongside NumVerify, not replacing it.
+    Returns fraud_score, line_type, carrier, risky, recent_abuse.
+    Free: 200 req/month at ipqualityscore.com.
+    """
+    if not phone or not IPQS_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"https://ipqualityscore.com/api/json/phone/{IPQS_API_KEY}/{phone}",
+                params={"fast": "true"},
+            )
+        if r.status_code != 200:
+            print(f"[osint] IPQS phone HTTP {r.status_code}")
+            return None
+        d = r.json()
+        if not d.get("success"):
+            return None
+        result = {
+            "fraud_score":    d.get("fraud_score"),
+            "valid":          d.get("valid"),
+            "line_type":      d.get("line_type"),
+            "carrier":        d.get("carrier"),
+            "country":        d.get("country"),
+            "risky":          d.get("risky"),
+            "recent_abuse":   d.get("recent_abuse"),
+            "do_not_call":    d.get("do_not_call"),
+            "prepaid":        d.get("prepaid"),
+        }
+        print(f"[osint] IPQS phone fraud_score={result['fraud_score']} line_type={result['line_type']}")
+        return result
+    except Exception as e:
+        print(f"[osint] IPQS phone error: {e}")
+        return None
+
+
+async def _hunter_email(email: Optional[str], timeout: float = 8.0) -> Optional[dict]:
+    """
+    Hunter.io — verify email and enrich with company/name data.
+    Free: 25 req/month at hunter.io.
+    Returns {deliverable, score, company, first_name, last_name, linkedin}.
+    """
+    if not email or not HUNTER_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                "https://api.hunter.io/v2/email-verifier",
+                params={"email": email, "api_key": HUNTER_API_KEY},
+            )
+        if r.status_code != 200:
+            print(f"[osint] Hunter HTTP {r.status_code}")
+            return None
+        d = r.json().get("data", {})
+        result = {
+            "status":      d.get("status"),        # valid/invalid/accept_all/unknown
+            "score":       d.get("score"),          # deliverability 0–100
+            "regexp":      d.get("regexp"),
+            "gibberish":   d.get("gibberish"),
+            "disposable":  d.get("disposable"),
+            "webmail":     d.get("webmail"),
+            "mx_records":  d.get("mx_records"),
+            "smtp_server": d.get("smtp_server"),
+        }
+        print(f"[osint] Hunter email status={result['status']} score={result['score']}")
+        return result
+    except Exception as e:
+        print(f"[osint] Hunter error: {e}")
+        return None
 
 
 def format_for_response(osint: dict) -> dict:
