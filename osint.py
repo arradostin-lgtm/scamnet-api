@@ -16,6 +16,8 @@ import httpx
 
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+# Vision API can use its own key (if restricted) or fall back to search key
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "") or GOOGLE_SEARCH_API_KEY
 BING_SEARCH_API_KEY = os.getenv("BING_SEARCH_API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
@@ -80,7 +82,8 @@ async def search_person(
 
     social_task = asyncio.create_task(
         _find_social_profiles(names, ctx, username=username, timeout=timeout,
-                              prefer_country=country or nationality)
+                              prefer_country=country or nationality,
+                              prefer_platform=platform_met)
     )
     mentions_task = asyncio.create_task(
         _find_scam_mentions(names, ctx, timeout=timeout)
@@ -136,6 +139,7 @@ async def _find_social_profiles(
     username: Optional[str],
     timeout: float = 15.0,
     prefer_country: Optional[str] = None,
+    prefer_platform: Optional[str] = None,
 ) -> dict:
     """
     Search social media profiles.
@@ -144,18 +148,29 @@ async def _find_social_profiles(
     Instead we use the domain as a bare keyword (e.g. "linkedin.com/in").
     Context terms (country, platform_met) are NOT added here — they break DDG.
     Country is used AFTER results are fetched to pick the best matching profile.
+    When prefer_platform is set (e.g. "Instagram"), we search that platform first
+    and with more results.
     """
     plat_timeout = min(9, timeout)
     tasks = []
 
-    for plat in SOCIAL_PLATFORMS:
+    # Sort platforms: prefer_platform goes first
+    platform_order = sorted(
+        SOCIAL_PLATFORMS,
+        key=lambda p: 0 if prefer_platform and prefer_platform.lower() in p["name"].lower() else 1
+    )
+
+    for plat in platform_order:
+        extra = prefer_platform and prefer_platform.lower() in plat["name"].lower()
         for name in names[:2]:
             tasks.append((plat, _search_one_platform(
-                name, plat, timeout=plat_timeout, prefer_country=prefer_country
+                name, plat, timeout=plat_timeout, prefer_country=prefer_country,
+                max_results=15 if extra else 10,
             )))
         if username:
             tasks.append((plat, _search_one_platform(
-                username, plat, timeout=plat_timeout, is_username=True, prefer_country=prefer_country
+                username, plat, timeout=plat_timeout, is_username=True, prefer_country=prefer_country,
+                max_results=15 if extra else 10,
             )))
 
     results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
@@ -181,6 +196,7 @@ async def _search_one_platform(
     timeout: float = 9.0,
     is_username: bool = False,
     prefer_country: Optional[str] = None,
+    max_results: int = 10,
 ) -> Optional[str]:
     """
     Search for one social platform profile.
@@ -201,8 +217,7 @@ async def _search_one_platform(
     domain_kw = "linkedin.com/in" if plat["name"] == "LinkedIn" else plat["domain"]
     query = f"{name_q} {domain_kw}"
 
-    # Request more results so profiles further down the list aren't missed
-    results = await _ddg_search(query, max_results=10, timeout=timeout)
+    results = await _ddg_search(query, max_results=max_results, timeout=timeout)
 
     candidates = []
     for r in results:
@@ -468,7 +483,7 @@ async def reverse_image_search(image_bytes: bytes, timeout: float = 20.0) -> dic
         }
     """
     # Google Cloud Vision — web detection, accepts base64 directly
-    if GOOGLE_SEARCH_API_KEY:
+    if GOOGLE_VISION_API_KEY:
         try:
             result = await _google_vision_web_detect(image_bytes, timeout)
             if result.get("social") or result.get("found_on") or result.get("entities"):
@@ -521,7 +536,7 @@ async def _google_vision_web_detect(image_bytes: bytes, timeout: float = 20.0) -
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(
             "https://vision.googleapis.com/v1/images:annotate",
-            params={"key": GOOGLE_SEARCH_API_KEY},
+            params={"key": GOOGLE_VISION_API_KEY},
             json={"requests": [{
                 "image": {"content": b64},
                 "features": [{"type": "WEB_DETECTION", "maxResults": 10}],
