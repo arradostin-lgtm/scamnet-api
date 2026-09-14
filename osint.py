@@ -20,6 +20,9 @@ GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "") or GOOGLE_SEARCH_API_KEY
 BING_SEARCH_API_KEY = os.getenv("BING_SEARCH_API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")        # vk.com/dev → Standalone app → Service token
+OPENSANCTIONS_API_KEY = os.getenv("OPENSANCTIONS_API_KEY", "")  # optional, free tier works without key
+HIBP_API_KEY = os.getenv("HIBP_API_KEY", "")                    # haveibeenpwned.com, $3.50/month
 
 # ── Scam forum / review sites to specifically search ──────────────────────────
 SCAM_SITES = [
@@ -57,11 +60,12 @@ async def search_person(
     platform_met: Optional[str] = None,
     username: Optional[str] = None,
     company: Optional[str] = None,
+    email: Optional[str] = None,
     timeout: float = 20.0,
 ) -> dict:
     """
     Search the internet for scam mentions and social profiles.
-    All available signals (name, country, platform, company, username) are
+    All available signals (name, country, platform, company, username, email) are
     combined into each query for compound matching — not searched separately.
 
     Returns:
@@ -70,6 +74,8 @@ async def search_person(
             "mentions": [{"source": "...", "text": "...", "url": "...", "severity": "..."}, ...],
             "search_urls": {"google": "...", ...},
             "query_names": ["name", ...],
+            "sanctions": [{"name": "...", "datasets": [...], "score": 0.9}, ...],
+            "email_breaches": ["Adobe", "LinkedIn", ...],
         }
     """
     names = [name] + [a for a in (aliases or []) if a and a != name]
@@ -88,17 +94,35 @@ async def search_person(
     mentions_task = asyncio.create_task(
         _find_scam_mentions(names, ctx, timeout=timeout)
     )
+    sanctions_task = asyncio.create_task(
+        _opensanctions_search(name, country=country or nationality, timeout=10.0)
+    )
+    async def _empty() -> list:
+        return []
+
+    hibp_task = asyncio.create_task(
+        _hibp_check(email, timeout=8.0) if email else _empty()
+    )
 
     try:
-        social, mentions = await asyncio.gather(social_task, mentions_task)
+        social, mentions, sanctions, email_breaches = await asyncio.gather(
+            social_task, mentions_task, sanctions_task, hibp_task,
+            return_exceptions=True,
+        )
+        if isinstance(social, Exception):           social = {}
+        if isinstance(mentions, Exception):         mentions = []
+        if isinstance(sanctions, Exception):        sanctions = []
+        if isinstance(email_breaches, Exception):   email_breaches = []
     except Exception:
-        social, mentions = {}, []
+        social, mentions, sanctions, email_breaches = {}, [], [], []
 
     return {
         "social": social,
         "mentions": mentions,
         "search_urls": _build_manual_search_urls(names[0], ctx),
         "query_names": names,
+        "sanctions": sanctions,
+        "email_breaches": email_breaches,
     }
 
 
@@ -150,6 +174,7 @@ async def _find_social_profiles(
     Country is used AFTER results are fetched to pick the best matching profile.
     When prefer_platform is set (e.g. "Instagram"), we search that platform first
     and with more results.
+    VK API search runs in parallel if VK_SERVICE_TOKEN is configured.
     """
     plat_timeout = min(9, timeout)
     tasks = []
@@ -173,6 +198,13 @@ async def _find_social_profiles(
                 max_results=15 if extra else 10,
             )))
 
+    # VK API search runs in parallel (more accurate than text search)
+    vk_task = None
+    if VK_SERVICE_TOKEN:
+        vk_task = asyncio.create_task(
+            _vk_api_search(names[0], country=prefer_country, timeout=plat_timeout)
+        )
+
     results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
 
     social: dict = {}
@@ -181,6 +213,16 @@ async def _find_social_profiles(
             continue
         if plat["name"] not in social:
             social[plat["name"]] = url
+
+    # VK API result overrides text-search VK result (more accurate)
+    if vk_task is not None:
+        try:
+            vk_result = await asyncio.wait_for(vk_task, timeout=plat_timeout)
+            if vk_result:
+                social["VK"] = vk_result
+                print(f"[osint] VK API found: {vk_result}")
+        except Exception as e:
+            print(f"[osint] VK API error: {e}")
 
     return social
 
@@ -273,6 +315,83 @@ def _pick_by_country(urls: list, country: str) -> Optional[str]:
         if prefix in url.lower():
             return url
     return None
+
+
+async def _vk_api_search(
+    name: str,
+    country: Optional[str] = None,
+    timeout: float = 9.0,
+) -> Optional[str]:
+    """
+    VK API users.search — returns profile URL of the best matching person.
+    Requires VK_SERVICE_TOKEN (vk.com/dev → Standalone app → Service token).
+    Filters by country when provided. Prefers profiles that have a photo.
+    """
+    if not VK_SERVICE_TOKEN:
+        return None
+
+    # Map country name (Russian/English) to VK country_id
+    # VK country IDs: Russia=1, Ukraine=2, Belarus=3, Kazakhstan=4,
+    # Uzbekistan=238, Germany=80, USA=203, Turkey=183, China=44, ...
+    _COUNTRY_TO_VK_ID = {
+        "россия": 1, "russia": 1,
+        "украина": 2, "ukraine": 2,
+        "беларусь": 3, "belarus": 3,
+        "казахстан": 4, "kazakhstan": 4,
+        "азербайджан": 6, "azerbaijan": 6,
+        "грузия": 7, "georgia": 7,
+        "армения": 8, "armenia": 8,
+        "кыргызстан": 10, "kyrgyzstan": 10,
+        "таджикистан": 26, "tajikistan": 26,
+        "узбекистан": 238, "uzbekistan": 238,
+        "германия": 80, "germany": 80,
+        "франция": 73, "france": 73,
+        "великобритания": 67, "uk": 67,
+        "сша": 203, "usa": 203, "united states": 203,
+        "турция": 183, "turkey": 183,
+        "китай": 44, "china": 44,
+        "польша": 146, "poland": 146,
+    }
+
+    params: dict = {
+        "q": name,
+        "count": 10,
+        "fields": "photo_max,city,country,screen_name",
+        "access_token": VK_SERVICE_TOKEN,
+        "v": "5.199",
+    }
+
+    if country:
+        vk_country_id = _COUNTRY_TO_VK_ID.get(country.lower().strip())
+        if vk_country_id:
+            params["country"] = vk_country_id
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                "https://api.vk.com/method/users.search",
+                params=params,
+            )
+        data = r.json()
+
+        if "error" in data:
+            print(f"[osint] VK API error: {data['error'].get('error_msg', data['error'])}")
+            return None
+
+        items = data.get("response", {}).get("items", [])
+        if not items:
+            return None
+
+        # Prefer users with a profile photo
+        with_photo = [u for u in items if u.get("photo_max") and "camera" not in u.get("photo_max", "")]
+        best = with_photo[0] if with_photo else items[0]
+
+        screen_name = best.get("screen_name") or f"id{best['id']}"
+        return f"https://vk.com/{screen_name}"
+
+    except Exception as e:
+        print(f"[osint] VK API exception: {e}")
+        return None
 
 
 async def _find_scam_mentions(
@@ -809,6 +928,120 @@ def _collect(href: str, title: str, social: dict, found_on: list) -> None:
 def _domain_label(url: str) -> str:
     m = re.search(r'https?://(?:www\.)?([\w\-]+\.[\w\-]+)', url)
     return m.group(1) if m else url[:40]
+
+
+async def _opensanctions_search(
+    name: str,
+    country: Optional[str] = None,
+    timeout: float = 10.0,
+) -> list:
+    """
+    Search OpenSanctions API — 100+ sanctions lists (UN, OFAC, EU, Interpol, national).
+    Free for non-commercial use. API key optional (higher rate limits with key).
+    Returns list of matched entities with source datasets and score.
+    """
+    params: dict = {"q": name, "schema": "Person", "limit": 5}
+
+    # Map country name to ISO-2 code for OpenSanctions filter
+    _COUNTRY_ISO2 = {
+        "россия": "RU", "russia": "RU",
+        "украина": "UA", "ukraine": "UA",
+        "узбекистан": "UZ", "uzbekistan": "UZ",
+        "казахстан": "KZ", "kazakhstan": "KZ",
+        "беларусь": "BY", "belarus": "BY",
+        "азербайджан": "AZ", "azerbaijan": "AZ",
+        "китай": "CN", "china": "CN",
+        "германия": "DE", "germany": "DE",
+        "сша": "US", "usa": "US", "united states": "US",
+        "великобритания": "GB", "uk": "GB",
+        "турция": "TR", "turkey": "TR",
+    }
+    if country:
+        iso2 = _COUNTRY_ISO2.get(country.lower().strip())
+        if iso2:
+            params["countries"] = iso2
+
+    headers: dict = {"Accept": "application/json"}
+    if OPENSANCTIONS_API_KEY:
+        headers["Authorization"] = f"ApiKey {OPENSANCTIONS_API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                "https://api.opensanctions.org/search/entities",
+                params=params,
+                headers=headers,
+            )
+        if r.status_code == 403:
+            print("[osint] OpenSanctions: API key required for this query")
+            return []
+        if r.status_code != 200:
+            print(f"[osint] OpenSanctions HTTP {r.status_code}")
+            return []
+
+        data = r.json()
+        results = []
+        for item in data.get("results", []):
+            score = item.get("score", 0)
+            if score < 0.5:
+                continue
+            props = item.get("properties", {})
+            results.append({
+                "name": (props.get("name") or [name])[0],
+                "score": round(score, 3),
+                "datasets": item.get("datasets", [])[:4],
+                "topics": item.get("topics", [])[:3],
+                "birth_date": (props.get("birthDate") or [None])[0],
+                "nationality": props.get("nationality", [])[:2],
+            })
+        if results:
+            print(f"[osint] OpenSanctions: {len(results)} hits for '{name}'")
+        return results
+    except Exception as e:
+        print(f"[osint] OpenSanctions error: {e}")
+        return []
+
+
+async def _hibp_check(email: Optional[str], timeout: float = 8.0) -> list:
+    """
+    Check email in HaveIBeenPwned — 700+ data breaches.
+    Returns list of breach names where this email appeared.
+    Requires HIBP_API_KEY ($3.50/month at haveibeenpwned.com).
+    Without key: silently returns empty list.
+    """
+    if not email or not HIBP_API_KEY:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}",
+                headers={
+                    "hibp-api-key": HIBP_API_KEY,
+                    "User-Agent": "Scamnet-OSINT/1.0",
+                },
+                params={"truncateResponse": "true"},
+            )
+        if r.status_code == 404:
+            return []
+        if r.status_code == 401:
+            print("[osint] HIBP: invalid API key")
+            return []
+        if r.status_code == 429:
+            print("[osint] HIBP: rate limited")
+            return []
+        if r.status_code != 200:
+            print(f"[osint] HIBP HTTP {r.status_code}")
+            return []
+
+        breaches = r.json()
+        names = [b.get("Name", "") for b in breaches if b.get("Name")]
+        if names:
+            print(f"[osint] HIBP: {len(names)} breaches for {email[:4]}***")
+        return names
+    except Exception as e:
+        print(f"[osint] HIBP error: {e}")
+        return []
 
 
 def format_for_response(osint: dict) -> dict:

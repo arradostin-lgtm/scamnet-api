@@ -38,7 +38,7 @@ from models import (
 from auth import google_auth_url, exchange_google_code, upsert_user, create_token, get_current_user
 from scoring import Scorer
 from osint import search_person, reverse_image_search, format_for_response as osint_format, _domain_label, REVERSE_SEARCH_LINKS
-from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD
+from face import compute_face_embedding, embedding_similarity, FACE_MATCH_THRESHOLD, analyze_exif
 
 app = FastAPI(title="Scamnet API", version="1.0.0", docs_url="/api/docs")
 
@@ -198,6 +198,7 @@ async def check_face(
     company: str = Form(""),
     country: str = Form(""),
     platform_met: str = Form(""),
+    email: str = Form(""),
     user = Depends(require_user),
 ):
     """
@@ -283,7 +284,16 @@ async def check_face(
                 d = row_to_dict(row)
                 profile_data = {k: d[k] for k in ProfilePublic.model_fields if k in d}
 
-    # ── Step 1: extract visible text / identity from photo via Claude Vision ──
+    # ── Step 1: EXIF analysis (no API, instant) ───────────────────────────────
+    exif_info = {}
+    try:
+        exif_info = analyze_exif(image_bytes)
+        if exif_info.get("risk_signals"):
+            print(f"[exif] signals: {exif_info['risk_signals']}")
+    except Exception as e:
+        print(f"[exif] error: {e}")
+
+    # ── Step 2: extract visible text / identity from photo via Claude Vision ──
     vision_info = {}
     try:
         vision_info = await _extract_identity_from_photo(image_bytes)
@@ -345,9 +355,12 @@ async def check_face(
                 platform_met=platform_met or None,
                 username=username or None,
                 company=company or vision_info.get("company") or None,
+                email=email or vision_info.get("email") or None,
                 timeout=18.0,
             )
             osint_data.update(osint_format(raw))
+            osint_data["sanctions"]      = raw.get("sanctions", [])
+            osint_data["email_breaches"] = raw.get("email_breaches", [])
 
         # 2. Reverse image search — always, regardless of DB match
         try:
@@ -399,12 +412,17 @@ async def check_face(
         "osint_entities":       osint_data.get("osint_entities", []),
         "osint_reverse_links":  osint_data.get("osint_reverse_links", REVERSE_SEARCH_LINKS),
         "vision_info":          osint_data.get("vision_info", {}),
+        # New: sanctions, HIBP breaches, EXIF signals
+        "sanctions":            osint_data.get("sanctions", []),
+        "email_breaches":       osint_data.get("email_breaches", []),
+        "exif":                 exif_info,
         "user_context": {k: v for k, v in {
             "known_name": known_name,
             "username": username,
             "company": company,
             "country": country,
             "platform_met": platform_met,
+            "email": email,
         }.items() if v},
     }
 

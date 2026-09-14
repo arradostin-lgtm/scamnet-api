@@ -272,6 +272,63 @@ def detect_ai_image(image_bytes: bytes) -> dict:
         }
 
 
+def analyze_exif(image_bytes: bytes) -> dict:
+    """
+    Analyze EXIF metadata for fraud risk signals.
+    AI-generated and screenshot photos typically have no EXIF or suspicious software field.
+    Returns: {has_exif, camera_make, camera_model, software, date_taken, gps_present, risk_signals}
+    """
+    result = {
+        "has_exif": False,
+        "camera_make": None,
+        "camera_model": None,
+        "software": None,
+        "date_taken": None,
+        "gps_present": False,
+        "risk_signals": [],
+    }
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        exif = getattr(img, "_getexif", lambda: None)()
+
+        if exif is None:
+            result["risk_signals"].append("Нет EXIF — возможно AI или скриншот")
+            return result
+
+        result["has_exif"] = True
+        make    = exif.get(271)   # Make
+        model   = exif.get(272)   # Model
+        software = exif.get(305)  # Software
+        date    = exif.get(36867) # DateTimeOriginal
+        gps     = exif.get(34853) # GPSInfo
+
+        result["camera_make"]  = str(make).strip()    if make    else None
+        result["camera_model"] = str(model).strip()   if model   else None
+        result["software"]     = str(software).strip() if software else None
+        result["date_taken"]   = str(date).strip()    if date    else None
+        result["gps_present"]  = bool(gps)
+
+        # Flag AI generation software
+        _AI_SW = ["stable diffusion", "midjourney", "dall-e", "firefly", "imagen",
+                  "generative", "nightcafe", "canva ai"]
+        if software:
+            sw_low = str(software).lower()
+            if any(hint in sw_low for hint in _AI_SW):
+                result["risk_signals"].append(f"ПО: {software} — AI-генератор")
+
+        if not make and not model:
+            result["risk_signals"].append("Нет данных о камере в EXIF")
+
+        if not date:
+            result["risk_signals"].append("Нет даты съёмки в EXIF")
+
+    except Exception:
+        result["risk_signals"].append("Не удалось прочитать EXIF")
+
+    return result
+
+
 def _local_ai_heuristic(image_bytes: bytes) -> float:
     """Quick local AI-image probability (0–1) without API calls."""
     signals = []
