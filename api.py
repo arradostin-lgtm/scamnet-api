@@ -192,6 +192,11 @@ async def _extract_identity_from_photo(image_bytes: bytes) -> dict:
 async def check_face(
     request: Request,
     file: UploadFile = File(...),
+    known_name: str = Form(""),
+    username: str = Form(""),
+    company: str = Form(""),
+    country: str = Form(""),
+    platform_met: str = Form(""),
     user = Depends(require_user),
 ):
     """
@@ -278,8 +283,12 @@ async def check_face(
             p.get("known_as") or p.get("real_name") or p.get("known_name") or ""
         )
 
-        # If person not in DB but Vision extracted a name from the photo — use it
-        if not search_name and vision_info.get("name"):
+        # User-provided name has second priority (after DB, before vision)
+        if not search_name and known_name:
+            search_name = known_name
+            print(f"[osint] using user-provided name: {search_name}")
+        # Vision-extracted name is last fallback
+        elif not search_name and vision_info.get("name"):
             search_name = vision_info["name"]
             print(f"[osint] using vision-extracted name: {search_name}")
 
@@ -290,13 +299,17 @@ async def check_face(
                 aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
             except Exception:
                 aliases = []
-            # Also add company from vision as search context
-            if vision_info.get("company"):
+            # Enrich aliases from user context and vision
+            if username:
+                aliases.append(username)
+            if company:
+                aliases.append(company)
+            elif vision_info.get("company"):
                 aliases.append(vision_info["company"])
             raw = await search_person(
                 name=search_name,
                 aliases=aliases,
-                nationality=p.get("nationality"),
+                nationality=p.get("nationality") or country or None,
                 timeout=18.0,
             )
             osint_data.update(osint_format(raw))
@@ -351,6 +364,13 @@ async def check_face(
         "osint_entities":       osint_data.get("osint_entities", []),
         "osint_reverse_links":  osint_data.get("osint_reverse_links", REVERSE_SEARCH_LINKS),
         "vision_info":          osint_data.get("vision_info", {}),
+        "user_context": {k: v for k, v in {
+            "known_name": known_name,
+            "username": username,
+            "company": company,
+            "country": country,
+            "platform_met": platform_met,
+        }.items() if v},
     }
 
 
