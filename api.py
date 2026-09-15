@@ -227,10 +227,14 @@ async def check_face(
     check_reason: str = Form(""),
     user = Depends(require_user),
 ):
-    """
-    Upload a face photo. Requires authentication.
-    Returns risk level, AI detection result, DB match, crowdsource signal.
-    """
+    # Strip whitespace/newlines from all text inputs to prevent URL encoding errors
+    known_name = known_name.strip()
+    username = username.strip()
+    company = company.strip()
+    country = country.strip()
+    platform_met = platform_met.strip()
+    email = email.strip()
+    phone = "".join(phone.split())  # remove all whitespace including \n
     image_bytes = await file.read()
     if len(image_bytes) > 10 * 1024 * 1024:
         raise HTTPException(413, "Image too large (max 10 MB)")
