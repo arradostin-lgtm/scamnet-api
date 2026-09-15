@@ -445,7 +445,14 @@ async def check_face(
                 print(f"[osint] using user-provided name: {search_name}")
 
         # 1. Text-based search by name
-        if search_name and len(search_name) > 3:
+        # Require at least a surname (2+ words) OR username/email to avoid
+        # flooding results with random people who share the same first name
+        name_specific_enough = (
+            len(search_name.split()) >= 2  # has surname
+            or username
+            or email
+        )
+        if search_name and len(search_name) > 3 and name_specific_enough:
             aliases_raw = p.get("known_aliases", "[]") or "[]"
             try:
                 aliases = json.loads(aliases_raw) if isinstance(aliases_raw, str) else (aliases_raw or [])
